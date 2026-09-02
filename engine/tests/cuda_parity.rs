@@ -6,10 +6,9 @@ use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
 use warchest::contract::{Call, Reply};
 use warchest::net::Net;
-use warchest::pbs::{expand_row, obs_key, pack_row, true_config, Ctx, PUBFEAT, ROW_BYTES};
+use warchest::pbs::{expand_row, pack_row, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
-use warchest::resolve::{gadget_iteration, PublicState, Solved};
-use warchest::search::{Budget, Cfg, Cfr, Solver, Step};
+use warchest::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 
 struct Backend(TestDevice);
@@ -32,7 +31,7 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
     GameCfg {
         agents: [Agent::Sog { cfg }; 2],
         collect: Collect::Sog,
-        explore: 0.0,
+        explore: 0.1,
         random_draft: true,
         p_td1: 0.0,
         query_rate: 0.0,
@@ -42,7 +41,7 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
 
 struct Run { data: Data }
 
-const GPU_SLOTS: usize = 16;
+const GPU_SLOTS: usize = 32;
 static DEVICE: OnceLock<Device> = OnceLock::new();
 
 fn shared_device() -> &'static Device {
@@ -76,12 +75,9 @@ fn shift_call(call: &Call, base: usize) -> Call {
     match &mut shifted {
         Call::Trunk { solve, .. }
         | Call::Configs { solve, .. }
-        | Call::Gadget { solve, .. }
         | Call::Tree { solve, .. }
         | Call::Iterate { solve, .. }
-        | Call::ReadPlay { solve, .. }
-        | Call::ReadRefresh { solve, .. }
-        | Call::ReadTarget { solve, .. } => *solve += base,
+        | Call::Read { solve, .. } => *solve += base,
     }
     shifted
 }
@@ -194,7 +190,7 @@ fn generate(
     out.into_iter().map(|data| Run { data }).collect()
 }
 
-fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Result<Box<Solved>, String>) {
+fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
     sv.pin(0);
     let mut replies: Vec<Reply> = Vec::new();
     loop {
@@ -220,17 +216,14 @@ fn fresh_batched_solves_use_supplied_beliefs_for_their_first_priors() {
     }
     let (mut solves, mut calls) = (Vec::new(), Vec::new());
     for (i, belief) in beliefs.into_iter().enumerate() {
-        let state = seed.nodes[0].state;
-        let actor = state.to_act();
-        let actual = true_config(&state, actor, &Ctx::new(&state));
-        let mut sv = Solver::play(None, &state, Ctx::new(&state),
-            Arc::clone(&net), cfg, belief, Rng::new(0xB3113F + i as u64), actual).unwrap();
+        let mut sv = Solver::new(&seed.nodes[0].state, Ctx::new(&seed.nodes[0].state),
+            Arc::clone(&net), cfg, belief, Rng::new(0xB3113F + i as u64));
         sv.pin(i);
         let Step::Calls(fresh) = sv.advance(&[]) else { panic!("a fresh solve asks for work") };
         calls.extend(fresh);
         solves.push(sv);
     }
-    let device = gpu(1);
+    let device = gpu(30);
     device.run(&calls, 0).expect("the card answered the first round");
     let mut priors = Vec::new();
     for (i, sv) in solves.iter().enumerate() {
@@ -302,7 +295,7 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
         (0x77C1, cfg(13, 0.0)),
         (0x2E57, cfg(17, 0.0)),
     ];
-    let device = || Backend(gpu(4));
+    let device = || Backend(gpu(7));
     let together = generate(&net, device(), &streams, 3);
     let twice = generate(&net, device(), &streams, 3);
     let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
@@ -339,7 +332,7 @@ fn shared_round(
     backend: &Backend,
     live: &mut [Solver],
     replies: &mut [Vec<Reply>],
-) -> Option<(usize, Result<Box<Solved>, String>)> {
+) -> Option<(usize, Option<Solved>)> {
     let mut calls: Vec<Call> = Vec::new();
     let mut spans = vec![0usize; live.len()];
     for (i, sv) in live.iter_mut().enumerate() {
@@ -373,7 +366,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
     };
 
     let (alone, tiny) = {
-        let device = Backend(gpu(5));
+        let device = Backend(gpu(11));
         let (mut g, mut data, sv) = small();
         let (sv, solved) = run_solve(&device, sv);
         let tiny = sv.nodes.len();
@@ -381,7 +374,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
         (data, tiny)
     };
 
-    let device = Backend(gpu(5));
+    let device = Backend(gpu(11));
     let mut big: Vec<Solver> = [(0x0A13u64, 1024u32, 8.0f32), (0x77C1, 1664, 13.0)]
         .iter()
         .enumerate()
@@ -433,152 +426,9 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 
 
 #[test]
-fn played_session_carries_across_a_round_boundary() {
-    let net = Arc::new(Net::random(0x9E37));
-    let cfg = Cfg { s: 2, c: 0.0, batch: 2, ..Default::default() };
-    let device = Backend(gpu(6));
-    let mut stream = GameStream::new(0x5E5510, game_cfg_of(cfg));
-    let mut data = Data::default();
-    let mut first_round = None;
-    for decision in 0..32 {
-        let mut solver = stream.next_solve(&net, &mut data);
-        solver.pin(0);
-        let mut replies = Vec::new();
-        let mut saw_gadget = false;
-        let solved = loop {
-            match solver.advance(&replies) {
-                Step::Calls(calls) => {
-                    saw_gadget |= calls.iter().any(|call| matches!(call, Call::Gadget { .. }));
-                    replies = device.run(&calls, 0).expect("session solve");
-                }
-                Step::Done(solved) => break solved,
-            }
-        };
-        assert_eq!(saw_gadget, decision > 0);
-        let round = solved.as_ref().expect("valid solve").focus.state.round;
-        let initial = *first_round.get_or_insert(round);
-        stream.keep(&solver, solved, &mut data);
-        if round > initial {
-            return;
-        }
-    }
-    panic!("the session did not cross a round boundary");
-}
-
-#[test]
-fn explored_actions_retain_coherent_boundaries() {
-    let net = Arc::new(Net::random(0xE1));
-    let cfg = Cfg { s: 1, c: 0.0, batch: 1, ..Default::default() };
-    let mut gc = game_cfg_of(cfg);
-    gc.explore = 1.0;
-    let device = Backend(gpu(7));
-    let mut stream = GameStream::new(0xE1, gc);
-    let mut data = Data::default();
-    let solver = stream.next_solve(&net, &mut data);
-    let (solver, solved) = run_solve(&device, solver);
-    let play = solved.as_ref().expect("a solved play");
-    let key = obs_key(&play.action.expect("a play solve chooses an action"));
-    let retained = &play.children.iter().find(|(k, _)| *k == key).expect("the explored child is live").1;
-    let state = play.focus.state;
-    let actor = state.to_act() as usize;
-    assert!(!retained.state.is_chance());
-    assert_ne!(retained.state.to_act() as usize, actor);
-    let prior = stream.belief()[actor].clone();
-    let behavior = warchest::policy::uniform(&state, &Ctx::new(&state), actor as u8, &prior.cfg);
-    let expected_range = behavior.posterior(&prior, key);
-    let expected_public = PublicState::from_state(retained.state);
-    stream.keep(&solver, solved, &mut data);
-    let mut next = stream.next_solve(&net, &mut data);
-    let Step::Calls(calls) = next.advance(&[]) else { panic!("a re-solve starts") };
-    let previous = calls.iter().find_map(|call| match call {
-        Call::Gadget { resolver, previous, .. } if *resolver as usize == 1 - actor => Some(previous),
-        _ => None,
-    }).expect("the child boundary is retained");
-    assert!(worst(&expected_range.p, previous, "retained range") < 2e-6);
-    let carried: Vec<_> = next.nodes.iter().filter(|node| node.carry).collect();
-    assert_eq!(carried.len(), next.nodes[0].child.len() + 1);
-    assert!(expected_public.same_public(&next.nodes[0].state));
-
-    let mut stream = GameStream::new(0xE2, gc);
-    let mut solver = stream.next_solve(&net, &mut data);
-    for _ in 0..64 {
-        let (finished, solved) = run_solve(&device, solver);
-        let play = solved.as_ref().expect("a solved play");
-        let key = obs_key(&play.action.expect("a play solve chooses an action"));
-        let chance = play.children.iter().find(|(k, _)| *k == key)
-            .filter(|(_, child)| child.state.is_chance())
-            .map(|(_, child)| PublicState::from_state(child.state));
-        stream.keep(&finished, solved, &mut data);
-        solver = stream.next_solve(&net, &mut data);
-        if let Some(chance) = chance {
-            assert!(chance.same_public(&solver.nodes[0].state));
-            assert!(solver.nodes[0].chance);
-            return;
-        }
-    }
-    panic!("exploration did not select a chance continuation");
-}
-
-#[test]
-fn gadget_and_carry_match_one_cpu_iteration() {
-    let net = Arc::new(Net::random(0x9E37));
-    let cfg = Cfg { s: 1, c: 0.0, batch: 1, cfr: Cfr::DISCOUNTED, ..Default::default() };
-    let device = Backend(gpu(8));
-    let mut stream = GameStream::new(0xC411, game_cfg_of(cfg));
-    let mut data = Data::default();
-    let first = stream.next_solve(&net, &mut data);
-    let (first, solved) = run_solve(&device, first);
-    stream.keep(&first, solved, &mut data);
-    let mut second = stream.next_solve(&net, &mut data);
-    second.pin(0);
-    let Step::Calls(calls) = second.advance(&[]) else { panic!("a re-solve asks for work") };
-    let resolver = calls.iter().find_map(|call| match call {
-        Call::Gadget { resolver, .. } => Some(*resolver),
-        _ => None,
-    }).expect("the second played solve has a gadget");
-    device.run(&calls, 0).expect("one gadget iteration");
-    let resident = device.0.resident(0, 0).expect("resident re-solve");
-    let n = resident.gadget.len() / 6;
-    let previous = &resident.gadget[..n];
-    let term = &resident.gadget[n..2 * n];
-    let opponent = 1 - resolver as usize;
-    let vo = opponent * second.nvals + second.nodes[0].voff as usize;
-    let follow = &resident.vals[vo..vo + n];
-    let mut regret = vec![[0.0; 2]; n];
-    let mut strategy = vec![[0.5; 2]; n];
-    let mut sum = vec![[0.0; 2]; n];
-    gadget_iteration(term, follow, &mut regret, &mut strategy, &mut sum, 0, cfg.cfr);
-    for k in 0..n {
-        assert!((resident.gadget[2 * n + k] - regret[k][0]).abs() < 2e-6);
-        assert!((resident.gadget[3 * n + k] - regret[k][1]).abs() < 2e-6);
-        assert!((resident.gadget[4 * n + k] - strategy[k][0]).abs() < 2e-6);
-        assert!((resident.gadget[5 * n + k] - strategy[k][1]).abs() < 2e-6);
-    }
-    let follow = strategy.iter().map(|s| s[1]).collect::<Vec<_>>();
-    let expected = previous.iter().zip(follow).map(|(&p, f)| 0.5 * (p + f / n as f32)).collect::<Vec<_>>();
-    let root = &second.nodes[0];
-    let root_at = root.roff as usize + if opponent == 0 { 0 } else { root.nc[0] as usize };
-    assert!(worst(&expected, &resident.reach[root_at..root_at + n], "gadget range") < 2e-6);
-    assert!(second.nodes[0].carry);
-    let focus = &second.nodes[0];
-    let counts = focus.nc.map(|x| x as usize);
-    let reach_n = counts[0] + counts[1];
-    assert!(resident.carry[..reach_n].iter().all(|x| x.is_finite() && *x >= 0.0));
-    for p in 0..2 {
-        let start = if p == 0 { 0 } else { counts[0] };
-        assert!(resident.carry[start..start + counts[p]].iter().sum::<f32>() > 0.0);
-        let values = p * second.nvals + focus.voff as usize;
-        assert_eq!(
-            &resident.carry[reach_n + start..reach_n + start + counts[p]],
-            &resident.vals[values..values + counts[p]],
-        );
-    }
-}
-
-#[test]
 fn cfr_average_uses_evaluated_strategies_and_global_steps() {
     let net = Arc::new(Net::random(0x9E37));
-    let device = Backend(gpu(9));
+    let device = Backend(gpu(28));
     let fresh = |s, batch| {
         let cfg = Cfg { s, c: 0.0, batch, cfr: Cfr::DISCOUNTED, ..Default::default() };
         let mut data = Data::default();
@@ -602,7 +452,7 @@ fn cfr_average_uses_evaluated_strategies_and_global_steps() {
 fn k_iterates_together_match_k_iterates_alone() {
     const K: usize = 4;
     let net = Net::random(0x9E37);
-    let device = gpu(8);
+    let device = gpu(20);
     let nets = Arc::new(net);
     let mut setup = Vec::new();
     let mut iterates = Vec::new();

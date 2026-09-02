@@ -12,7 +12,6 @@ def dump(n, ncfg, na, ncells):
     cc = np.zeros((n * ncfg, CCOUNTS), np.uint8)
     cw = np.full(n * ncfg, 1.0 / max(ncfg, 1), np.float32)
     cy = np.zeros(n * ncfg, np.float32)
-    cm = np.ones(n * ncfg, np.uint8)
     per = max(ncfg // 2, 1)
     coff = [0]
     for _ in range(n):
@@ -32,11 +31,11 @@ def dump(n, ncfg, na, ncells):
     created = np.zeros(n, np.float64)
     td1 = np.zeros(n, np.uint8)
     pol = (pa, paoff, pcoff, pci, pact, pprob)
-    return rows, cc, cw, cy, cm, coff, soff, source, truth, outcome, created, td1, pol
+    return rows, cc, cw, cy, coff, soff, source, truth, outcome, created, td1, pol
 
 
 def check(buf, ids):
-    _x, cc, _cp, _cw, _cy, _seg, _cm, pol = buf.gather(ids)
+    _x, cc, _cp, _cw, _cy, _seg, pol = buf.gather(ids)
     pa, pact, _pcrow, pcfg, _pp, _parow = pol
     n_cfg, n_act = len(cc), len(pa)
     assert pcfg.size == 0 or int(pcfg.max()) < n_cfg, (int(pcfg.max()), n_cfg)

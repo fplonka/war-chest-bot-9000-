@@ -3,7 +3,6 @@ use crate::board::NONE;
 use crate::contract::{Call, Dst, Prime, QueryPick, Reply, Writes};
 use crate::net::Net;
 use crate::pbs::*;
-use crate::resolve::{PublicState, Solved};
 use crate::rng::Rng;
 use crate::state::{Cont, State};
 use crate::units::{ENSIGN, MARSHAL, ROYAL_COIN};
@@ -46,20 +45,14 @@ pub struct Budget(pub [usize; 8]);
 
 impl Budget {
     pub fn for_s(s: u32) -> Budget {
-        let growth = |at512: usize| (at512 * s as usize / 512).max(1);
-        let mut cap = BUDGET_512.0.map(growth);
-        cap[Ent::Config as usize] = cap[Ent::Config as usize].max(2 * MAX_CONFIG_SUPPORT);
-        Budget(cap)
+        let k = |at512: usize| (at512 * s as usize / 512).max(1);
+        let mut b = Budget(BUDGET_512.0.map(k));
+        b.0[Ent::Config as usize] = b.0[Ent::Config as usize].max(2 * crate::pbs::MAX_CONFIG_SUPPORT);
+        b
     }
 
     pub fn cap(&self, e: Ent) -> usize {
         self.0[e as usize]
-    }
-
-    pub(crate) fn storage(self) -> Budget {
-        let mut cap = std::array::from_fn(|i| self.0[i] + BUDGET_512.0[i]);
-        cap[Ent::Config as usize] += INITIAL_TREE_CONFIG_RANGES * MAX_CONFIG_SUPPORT;
-        Budget(cap)
     }
 
     pub fn host_slot_bytes(&self) -> usize {
@@ -87,7 +80,6 @@ impl Default for Budget {
 }
 
 
-const INITIAL_TREE_CONFIG_RANGES: usize = 2 * NSLOT + 4;
 const BUDGET_512: Budget = Budget([16_595, 136_283, 346_018, 174_834, 10_090, 8_219, 921, 259_756]);
 
 #[derive(Clone, Copy)]
@@ -281,7 +273,6 @@ pub struct TNode {
     pub leaf: bool,
     pub expandable: bool,
     pub exhausted: bool,
-    pub carry: bool,
     pub chance: bool,
     pub draw: DrawMap,
     pub draw_steps: u8,
@@ -324,6 +315,12 @@ struct Mark {
     leaf_coff: usize,
     leaf_cidx: usize,
     counts: Counts,
+}
+
+pub struct Solved {
+    pub value: [Vec<f32>; 2],
+    pub queries: Vec<(State, [Belief; 2])>,
+    pub policy: Policy,
 }
 
 #[derive(Default, Clone)]
@@ -471,20 +468,7 @@ enum Phase {
 
 pub enum Step {
     Calls(Vec<Call>),
-    Done(Result<Box<Solved>, String>),
-}
-
-#[derive(Clone, Copy, Default)]
-enum Finish {
-    Play(Config),
-    Refresh,
-    #[default]
-    Target,
-}
-
-struct Gadget {
-    resolver: u8,
-    terminate: Vec<f32>,
+    Done(Option<Solved>),
 }
 
 #[derive(Default)]
@@ -505,6 +489,7 @@ pub struct Solver {
     resealed: Vec<u32>,
     pub root_belief: [Belief; 2],
     pub cur: Vec<f32>,
+    pub avg: Vec<f32>,
     pub grown: Vec<u32>,
     pub(crate) avg_touched: [bool; 2],
     pub counts: Counts,
@@ -513,12 +498,6 @@ pub struct Solver {
     budget_hit: u8,
     wants_prior: Vec<u32>,
     pub(crate) steps: [usize; 2],
-    focus: usize,
-    horizon: u16,
-    finish: Finish,
-    pub(crate) explore: f32,
-    gadget: Option<Gadget>,
-    gadget_sent: bool,
 
     pub leaf_rows: Vec<usize>,
     pub(crate) term_leaves: Vec<usize>,
@@ -535,7 +514,6 @@ pub struct Solver {
     bmap: std::collections::HashMap<u64, u32, KeyHash>,
     pub(crate) packed: Vec<u8>,
     abandon: bool,
-    failure: Option<String>,
     draw_scratch: DrawScratch,
     cell_order: Vec<(u64, u32)>,
 
@@ -560,9 +538,37 @@ impl Drop for Solver {
     }
 }
 
-mod resolving;
-
 impl Solver {
+    pub fn new(root: &State, ctx: Ctx, net: Arc<Net>, cfg: Cfg, belief: [Belief; 2], rng: Rng) -> Solver {
+        let root_configs: usize = belief.iter().map(Belief::len).sum();
+        assert!(
+            root_configs <= 2 * crate::pbs::MAX_CONFIG_SUPPORT,
+            "root has {root_configs} configs, above the game's support bound"
+        );
+        assert!(
+            root_configs <= cfg.budget.cap(Ent::Config),
+            "device slot holds {} configs but this root needs {root_configs}",
+            cfg.budget.cap(Ent::Config)
+        );
+        let cfgs: [Arc<[Config]>; 2] = [belief[0].cfg.as_slice().into(), belief[1].cfg.as_slice().into()];
+        let mut sv = Solver::default();
+        sv.ctx = ctx;
+        sv.net = net;
+        sv.rng = rng;
+        sv.cfg = cfg;
+        sv.root_belief = belief;
+        sv.nodes = NODES.with(Pool::take);
+        sv.cphi = CONFIGS.with(Pool::take);
+        sv.cmap = std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash);
+        sv.bmap = std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash);
+        sv.nodes.reserve(640);
+        sv.cur.reserve(640);
+        sv.seed = Rng::new(sv.rng.next_u64()).0;
+        let root = sv.push_node(crate::contract::NO_ROW, *root, cfgs);
+        sv.expand(root);
+        sv
+    }
+
     pub fn pin(&mut self, slot: usize) {
         self.slot = slot;
     }
@@ -677,7 +683,6 @@ impl Solver {
             leaf: true,
             expandable: !terminal,
             exhausted: false,
-            carry: false,
             chance: false,
             draw: DrawMap::default(),
             draw_steps: 0,
@@ -954,7 +959,7 @@ impl Solver {
                 self.rewind(id, mark);
                 return;
             }
-            if !wp && cs.round > self.horizon {
+            if !wp && cs.round > self.nodes[0].state.round + self.cfg.rounds as u16 {
                 for n in &mut self.nodes[mark.nodes..] {
                     n.expandable = false;
                 }
@@ -1022,22 +1027,6 @@ impl Solver {
             legal_child[cell] = obs_child[au as usize] as u32;
         }
         let (action_off, action_cell) = group_by(legal_action.iter().map(|&a| a as usize), na);
-        for ch in 0..nch {
-            let mut effect: Option<PublicState> = None;
-            for &au in &obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize] {
-                let a = au as usize;
-                let cell = action_cell[action_off[a] as usize] as usize;
-                let mut next = s;
-                set_config(&mut next, player, &self.ctx, &mine[cell_row[cell] as usize]);
-                next.apply_inplace(acts[a]);
-                let public = PublicState::from_state(next);
-                if effect.as_ref().is_some_and(|old| old != &public) {
-                    self.failure = Some(format!("observation {} has ambiguous public children", obs_keys[ch]));
-                    return;
-                }
-                effect = Some(public);
-            }
-        }
         let mut child_cfgs: Vec<Vec<Config>> = vec![Vec::new(); nch];
         let mut ent = std::mem::take(&mut self.cell_order);
         for ch in 0..nch {
@@ -1283,13 +1272,9 @@ impl Solver {
                 self.absorb();
                 self.phase = Phase::Done;
                 let last = replies.last().expect("a round answers every call it was given");
-                return Step::Done(self.read_back(last).map(Box::new));
+                return Step::Done(self.read_back(last));
             }
             Phase::Done => unreachable!("a finished solve is not advanced again"),
-        }
-        if let Some(error) = self.failure.take() {
-            self.phase = Phase::Done;
-            return Step::Done(Err(error));
         }
         if self.at < self.cfg.iters() {
             self.phase = Phase::Iterating;
@@ -1345,19 +1330,46 @@ impl Solver {
 
     fn opening_calls(&mut self) -> Vec<Call> {
         let mut calls = self.growth_calls();
-        if !self.gadget_sent {
-            if let Some(gadget) = &self.gadget {
-                calls.push(Call::Gadget {
-                    solve: self.slot,
-                    resolver: gadget.resolver,
-                    previous: self.root_belief[1 - gadget.resolver as usize].p.clone(),
-                    terminate: gadget.terminate.clone(),
-                });
-            }
-            self.gadget_sent = true;
-        }
         calls.push(self.tree_call());
         calls
+    }
+
+    fn read_round(&mut self) -> Vec<Call> {
+        let mut calls = self.opening_calls();
+        let nvals = self.nvals as u32;
+        let vals_at = match self.collect {
+            None => [(0, 0); 2],
+            Some(_) => [(self.nodes[0].voff, self.nodes[0].nc[0]), (nvals + self.nodes[0].voff, self.nodes[0].nc[1])],
+        };
+        let (at, cells) = self.root_cells();
+        calls.push(Call::Read {
+            solve: self.slot,
+            touched: self.avg_touched,
+            vals_at,
+            policy_at: (at as u32, cells as u32),
+        });
+        calls
+    }
+
+    fn read_back(&mut self, r: &Reply) -> Option<Solved> {
+        let (at, cells) = self.root_cells();
+        self.avg = vec![0.0; at + cells];
+        self.avg[at..at + cells].copy_from_slice(&r.b);
+        self.collect?;
+        let n0 = self.nodes[0].nc[0] as usize;
+        let value = [r.a[..n0].to_vec(), r.a[n0..].to_vec()];
+        let policy = self.root_policy();
+        let queries = std::mem::take(&mut self.queries);
+        Some(Solved { value, queries, policy })
+    }
+
+    fn root_cells(&self) -> (usize, usize) {
+        let n = &self.nodes[0];
+        if n.leaf || n.chance {
+            (0, 0)
+        } else {
+            (n.soff as usize, n.legal_action.len())
+        }
     }
 
     fn tree_call(&mut self) -> Call {
@@ -1388,9 +1400,6 @@ impl Solver {
         }
         w.f32s_both(Dst::Cur, Dst::Prior, sent, &self.cur[sent..]);
         let (prime, acts, cells) = self.prime();
-        let carry: Vec<u32> = self.nodes.iter().enumerate()
-            .filter_map(|(i, n)| n.carry.then_some(i as u32)).collect();
-        let carry_len = carry.iter().map(|&i| 2 * self.nodes[i as usize].nc.iter().sum::<u32>() as usize).sum();
         let call = Call::Tree {
             solve: self.slot,
             writes: w,
@@ -1398,10 +1407,7 @@ impl Solver {
             ncells: self.counts.cells,
             nreach: self.nreach,
             nvals: self.nvals,
-            root_n: self.nodes[0].nc,
             levels: self.contract.level_start.clone(),
-            carry,
-            carry_len,
             nterm: self.term_leaves.len(),
             seed: first.then_some(self.seed),
             prime,
@@ -1448,5 +1454,36 @@ impl Solver {
             cells.extend_from_slice(&n.legal_action);
         }
         (prime, acts, cells)
+    }
+
+    pub fn root_policy(&self) -> Policy {
+        let n = &self.nodes[0];
+        if n.leaf || n.chance || self.avg.is_empty() {
+            return Policy::default();
+        }
+        let me = n.player as usize;
+        let mut out = Policy {
+            acts: (0..n.na())
+                .map(|a| action_desc(&n.acts[a], n.player, &self.ctx, n.aslot[a]))
+                .collect(),
+            ..Default::default()
+        };
+        let so = self.nodes[0].soff as usize;
+        out.off.push(0);
+        for c in 0..n.nc[me] as usize {
+            for cell in n.legal_row(c) {
+                out.act.push(n.legal_action[cell] as u16);
+                out.p.push(self.avg[so + cell]);
+            }
+            out.off.push(out.act.len() as u32);
+        }
+        out
+    }
+
+    pub(crate) fn root_strategy(&self, config: usize) -> &[f32] {
+        let row = self.nodes[0].legal_row(config);
+        assert!(!self.avg.is_empty(), "the solve must finish before its average is read");
+        let so = self.nodes[0].soff as usize;
+        &self.avg[so + row.start..so + row.end]
     }
 }

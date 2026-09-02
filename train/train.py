@@ -35,7 +35,6 @@ NSLOT = warchest.NSLOT
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
 POLICY_METRICS = ("policy_loss", "policy_target_entropy", "policy_prior_entropy",
                   "policy_search_kl")
-REPLAY_FORMAT = 3
 
 
 def fold(window, lists, stat):
@@ -69,7 +68,6 @@ class Buffer:
         self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
         self.cw = np.zeros(ccap, np.float32)
         self.cy = np.zeros(ccap, np.float16)
-        self.cm = np.zeros(ccap, np.uint8)
         self.pastart = np.zeros(cap, np.int64)
         self.palen = np.zeros(cap, np.int32)
         self.pcstart = np.zeros(cap, np.int64)
@@ -96,7 +94,7 @@ class Buffer:
         "x", "cstart", "clen", "pastart", "palen", "pcstart", "pclen",
         "written_at", "created_at", "source", "truth", "outcome", "td1")
     _ARENAS = (
-        ("cstart", "clen", ("cc", "cw", "cy", "cm"), "cfgs", "ccap"),
+        ("cstart", "clen", ("cc", "cw", "cy"), "cfgs", "ccap"),
         ("pastart", "palen", ("pa",), "acts", "acap"),
         ("pcstart", "pclen", ("pci", "pact", "pp"), "cells", "pcap"))
 
@@ -144,7 +142,7 @@ class Buffer:
             getattr(self, start)[ring] += base
         self.soff = np.asarray(state["soff"], np.int64).copy()
 
-    def add(self, x, cc, cw, cy, cm, coff, soff, source, truth, outcome, created,
+    def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, created,
             td1, pol=None):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
@@ -179,7 +177,7 @@ class Buffer:
             self.outcome[ring] = outcome[i:j]
             self.td1[ring] = td1[i:j]
         sl = (np.arange(m) + self.cfgs) % self.ccap
-        self.cc[sl], self.cw[sl], self.cy[sl], self.cm[sl] = cc, cw, cy, cm
+        self.cc[sl], self.cw[sl], self.cy[sl] = cc, cw, cy
         if pol is not None:
             alen = np.diff(paoff).astype(np.int32)
             clen = np.diff(pcoff).astype(np.int32)
@@ -245,7 +243,7 @@ class Buffer:
         mass = np.bincount(seg, weights=cw, minlength=2 * len(ids)).astype(np.float32)
         cw /= mass[seg]
         return (self.x[s], self.cc[at], player, cw,
-                self.cy[at].astype(np.float32), seg, self.cm[at], pol)
+                self.cy[at].astype(np.float32), seg, pol)
 
     def sample_ids(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         ids = rng.integers(self.lo, self.rows, size=batch)
@@ -267,20 +265,13 @@ class Buffer:
         ids = np.arange(self.lo, self.rows, dtype=np.int64) % self.cap
         n = max(len(ids), 1)
         source = np.bincount(self.source[ids], minlength=3)
-        configs = int(self.clen[ids].sum(dtype=np.int64))
-        labeled = 0
-        if len(ids):
-            start = int(self.cstart[ids[0]] % self.ccap)
-            first = min(configs, self.ccap - start)
-            labeled = int(self.cm[start:start + first].sum(dtype=np.int64)
-                          + self.cm[:configs - first].sum(dtype=np.int64))
+        configs = self.clen[ids].sum(dtype=np.int64)
         return {
             "replay_warm_frac": source[0] / n,
             "replay_play_frac": source[1] / n,
             "replay_query_frac": source[2] / n,
             "replay_td1_row_frac": float(self.td1[ids].sum()) / n,
-            "replay_value_target_frac": labeled / max(configs, 1),
-            "replay_td1_target_frac": 2.0 * self.td1[ids].sum() / max(labeled, 1),
+            "replay_td1_target_frac": 2.0 * self.td1[ids].sum() / max(configs, 1),
             "target_age_max": (time.time() - self.created_at[ids].min()
                                if len(ids) else 0.0),
         }
@@ -308,7 +299,7 @@ def forward_values(net, parts):
     return net(*parts[:4], parts[5])
 
 
-def losses(net, xpub, phi, w, seg, y, nseg, mask, policy=None, wp=1.0, stats=None):
+def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     v = net(xpub, phi, w, seg, nseg)
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
@@ -322,9 +313,9 @@ def losses(net, xpub, phi, w, seg, y, nseg, mask, policy=None, wp=1.0, stats=Non
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
     total = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
-    total.index_add_(0, seg, per * mask)
-    count.index_add_(0, seg, mask)
-    loss = (total / count.clamp(min=1)).sum() / (count > 0).sum().clamp(min=1)
+    total.index_add_(0, seg, per)
+    count.index_add_(0, seg, torch.ones_like(per))
+    loss = (total / count.clamp(min=1)).mean()
     if stats is not None:
         stats["value_loss"] = float(loss.detach())
     if policy is not None and wp > 0.0:
@@ -449,8 +440,8 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             stat[f"sample_{name}_delay_sum"] += float(
                 delay[source_id == source_id_value].sum())
         stat["sample_td1_targets"] += 2 * int(buf.td1[ring].sum())
+        stat["sample_targets"] += int(buf.clen[ring].sum())
         sampled = buf.gather(ids)
-        stat["sample_targets"] += int(sampled[6].sum())
         stat["batch_configs"] += len(sampled[1])
         parts = batch_fn(sampled, rng, device)
         if stream is not None:
@@ -499,11 +490,9 @@ def ingest(buf, data, warm=False):
     if bad_cw or bad_cy:
         raise SystemExit(
             f"non-finite collect values: data['cw']={bad_cw}, data['cy']={bad_cy}")
-    cm = np.asarray(data["cm"], np.uint8)
-    if len(cm) != len(cy) or np.any(cm > 1):
-        raise SystemExit("invalid collect value mask")
     if not len(x):
         return 0
+    cy = np.clip(cy, -1.0, 1.0)
     coff = np.asarray(data["coff"], np.int64)
     soff = np.asarray(data["soff"], np.int64)
     query = np.asarray(data["query"], np.uint8)
@@ -518,7 +507,7 @@ def ingest(buf, data, warm=False):
            np.asarray(data["pci"], np.uint16),
            np.asarray(data["pcell"], np.uint16),
            np.asarray(data["pprob"], np.float16))
-    buf.add(x, cc, cw, cy.astype(np.float16), cm, coff, soff,
+    buf.add(x, cc, cw, cy.astype(np.float16), coff, soff,
             source, truth, outcome, created, td1, pol)
     return len(x)
 
@@ -599,8 +588,6 @@ def main():
         if over:
             raise SystemExit("resume only accepts a minutes extension")
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
-        if checkpoint.get("replay_format") != REPLAY_FORMAT:
-            raise SystemExit("resume replay was produced by an incompatible search")
         args = config.Cfg(**checkpoint["cfg"])
         if minutes is not None:
             if minutes < args.minutes:
@@ -690,15 +677,14 @@ def main():
     seg = torch.arange(k, device=dev) % (2 * n)
     w = torch.bincount(seg, minlength=2 * n).float().reciprocal()[seg]
     y = torch.zeros(k, device=dev)
-    mask = torch.ones(k, device=dev)
-    parts = (x, phi, w, seg, y, 2 * n, mask, None)
+    parts = (x, phi, w, seg, y, 2 * n, None)
     scratch = Net().to(dev)
     scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr)
     losses(scratch, *parts, wp=0.0).backward()
     scratch_opt.step()
     forward_values(scratch, parts)
     torch.cuda.synchronize(dev)
-    del scratch_opt, scratch, parts, x, phi, w, seg, y, mask
+    del scratch_opt, scratch, parts, x, phi, w, seg, y
 
     torch.manual_seed(args.seed)
     value = Net().to(dev)
@@ -769,7 +755,6 @@ def main():
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all(),
             "buffer": buf.state_dict(),
-            "replay_format": REPLAY_FORMAT,
             "elapsed": float(el),
             "next_snapshot": float(el + snap_gap),
             "epoch": epoch,
@@ -779,15 +764,7 @@ def main():
             "t": round(el, 1),
             "label": label,
             "git": args.git,
-            "search": {
-                "s": args.s,
-                "c": args.c,
-                "batch": args.round_batch,
-                "rounds": args.rounds,
-                "cfr": args.cfr,
-                "puct": args.puct,
-                "prior_temp": args.prior_temp,
-            },
+            "search": {"s": args.s, "c": args.c, "cfr": args.cfr},
         }
         tmp = path + ".tmp"
         torch.save(state, tmp)
@@ -841,8 +818,6 @@ def main():
             explore=args.explore,
             random_draft=args.random_draft,
             cfr=args.cfr,
-            puct=args.puct,
-            prior_temp=args.prior_temp,
             p_td1=args.p_td1,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,
@@ -882,11 +857,10 @@ def main():
             ta = time.time()
             n = ingest(buf, data)
             add_s = time.time() - ta
-            cy = np.asarray(data["cy"], np.float32)
+            cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
             cw = np.asarray(data["cw"], np.float32)
-            cm = np.asarray(data["cm"], np.uint8) != 0
-            window_targets.append(cy[cm])
-            window_target_weights.append(cw[cm])
+            window_targets.append(cy)
+            window_target_weights.append(cw)
 
             solves = int(data["solves"])
             sog_solves += solves
@@ -894,10 +868,10 @@ def main():
             window["results"] += 1
             window["rows"] += n
             window["solves"] += solves
-            window["target_n"] += int(cm.sum())
-            window["target_sum"] += float(cy[cm].sum(dtype=np.float64))
+            window["target_n"] += cy.size
+            window["target_sum"] += float(cy.sum(dtype=np.float64))
             window["target_square_sum"] += float(
-                np.square(cy[cm].astype(np.float64)).sum())
+                np.square(cy.astype(np.float64)).sum())
             window["gen_s"] += gen_s
             window["add_s"] += add_s
             window_shapes.extend(data.get("shapes") or [])
@@ -959,8 +933,7 @@ def main():
             belief_mean = float(np.dot(targets, target_weights) / weight_mass)
             belief_var = max(float(np.dot((targets - belief_mean) ** 2,
                                           target_weights) / weight_mass), 0.0)
-            target_q = (np.quantile(targets, [0.05, 0.5, 0.95])
-                        if targets.size else np.full(3, np.nan))
+            target_q = np.quantile(targets, [0.05, 0.5, 0.95])
             sample_ages, sample_delays = (
                 np.concatenate(window_lists[key]) if window_lists.get(key) else np.zeros(1)
                 for key in ("sample_ages", "sample_delays"))
@@ -1059,9 +1032,7 @@ def main():
                 "tgt_p05": round(float(target_q[0]), 4),
                 "tgt_p50": round(float(target_q[1]), 4),
                 "tgt_p95": round(float(target_q[2]), 4),
-                "tgt_abs95_frac": round(
-                    float(np.mean(np.abs(targets) >= 0.95))
-                    if targets.size else float("nan"), 4),
+                "tgt_abs95_frac": round(float(np.mean(np.abs(targets) >= 0.95)), 4),
                 **{key: round(value, 4) for key, value in diag.items()
                    if key not in ("loss_old", "loss_new")},
                 "gen_s": round(gen_s, 2),
@@ -1174,7 +1145,7 @@ def main():
             n = ingest(buf, d, warm=True)
             steps = max(1, n // args.batch) if len(buf) >= args.batch else 0
             lv, train_s, _ = fit(steps)
-            cy = np.asarray(d["cy"], np.float32)
+            cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
             rec = {
                 "t": round(time.time() - t0, 1), "epoch": epoch, "phase": "warm",
                 "games": int(d.get("games", 0)), "rows": n,

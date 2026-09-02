@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 use warchest::arena::{Ask, Done, Hello, Reply, Request, PROTOCOL};
-use warchest::bot::{Brain, Session};
+use warchest::bot::{Brain, Mind, Session};
 use warchest::cuda::Device;
 use warchest::farm::Cards;
 use warchest::net::Net;
@@ -26,12 +26,12 @@ fn work(
             .ok_or_else(|| format!("game {} was never started", ask.id))?,
     };
     for obs in &ask.obs {
-        session.observe(obs)?;
+        session.observe(obs, brain)?;
     }
     let action = if act {
         Some(session.decide(brain)?)
     } else {
-        session.watch(brain)?;
+        session.watch(brain);
         None
     };
     sessions.lock().unwrap().insert(ask.id, session);
@@ -62,9 +62,14 @@ fn run() -> Result<(), String> {
     let weights = packed.dir.join(&packed.manifest.weights);
     let net = Net::load_bin(weights.to_str().ok_or("invalid weights path")?)
         .map_err(|e| format!("{}: {e}", weights.display()))?;
-    let cards = Arc::new(Cards::new(Device::new(&devices, &net, cfg, usize::MAX)?));
+    let mind = Mind::Sog(Arc::new(Cards::new(Device::new(
+        &devices,
+        &net,
+        cfg,
+        usize::MAX,
+    )?)));
     let brain = Brain {
-        cards,
+        mind,
         net: Arc::new(net),
         cfg,
     };

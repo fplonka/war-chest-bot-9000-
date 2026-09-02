@@ -4,7 +4,7 @@ use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES, N_LOCATIONS};
 use crate::pbs::{action_legal, advance_config, obs_key, set_config, Belief, Config, Ctx};
 use crate::rng::Rng;
-use crate::search::{node_actions, Policy};
+use crate::search::{node_actions, Policy, Solver};
 use crate::state::{State, Z_ELIM};
 
 pub struct NodePolicy {
@@ -40,12 +40,6 @@ impl NodePolicy {
             legal_action,
             probs: vec![0.0; cells],
         }
-    }
-
-    pub fn of(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], policy: &Policy) -> NodePolicy {
-        let mut np = Self::frame(s, ctx, player, cfgs);
-        np.probs.copy_from_slice(&policy.p);
-        np
     }
 
     #[inline]
@@ -125,6 +119,14 @@ impl NodePolicy {
         }
         Belief::from_pairs(pairs)
     }
+
+    pub fn cell_for(&self, obs: u32) -> Option<(usize, usize)> {
+        (0..self.legal_off.len() - 1).find_map(|ci| {
+            self.row(ci)
+                .find(|&cell| obs_key(&self.acts[self.action_at(cell)]) == obs)
+                .map(|cell| (ci, cell))
+        })
+    }
 }
 
 pub fn uniform(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
@@ -137,6 +139,27 @@ pub fn uniform(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy 
         }
     }
     np
+}
+
+pub fn root(sv: &Solver) -> NodePolicy {
+    let n = &sv.nodes[0];
+    let cfgs = n.cfgs[n.player as usize].as_ref();
+    if n.legal_off.is_empty() {
+        return uniform(&sv.nodes[0].state, &sv.ctx, n.player, cfgs);
+    }
+    let mut policy = NodePolicy {
+        acts: n.acts.clone(),
+        aslot: n.aslot.clone(),
+        fdown: n.fdown.clone(),
+        legal_off: n.legal_off.clone(),
+        legal_action: n.legal_action.clone(),
+        probs: vec![0.0; n.legal_action.len()],
+    };
+    for config in 0..cfgs.len() {
+        let row = policy.row(config);
+        policy.probs[row].copy_from_slice(sv.root_strategy(config));
+    }
+    policy
 }
 
 pub fn eval_static(s: &State, p: u8) -> f32 {

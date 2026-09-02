@@ -51,12 +51,13 @@ def pack(run):
                                 weights_only=False)
         net = Net()
         net.load_state_dict(checkpoint["value"])
-        search = checkpoint.get("search")
-        required = ["s", "c", "batch", "rounds", "cfr", "puct", "prior_temp"]
-        missing = [key for key in required if not isinstance(search, dict) or key not in search]
-        if missing:
-            raise SystemExit(f"{snap['file']} is missing packed search fields: {', '.join(missing)}")
-        search = {key: search[key] for key in required}
+        search = {"s": cfg.get("s", 512),
+                  "c": cfg.get("c", 8.0),
+                  "batch": cfg.get("round_batch", 8),
+                  "rounds": cfg.get("rounds", 0),
+                  "puct": 1.5,
+                  "prior_temp": 1.0,
+                  "cfr": "dcfr"}
         final = snap is snapshots[-1]
         stem = Path(snap["file"]).stem.removeprefix("snap_")
         bot = "final" if final else f"{stem}-{snap['label']}"

@@ -29,8 +29,7 @@ use crate::state::{CONT_CAP, MAX_MAIN_PLAYS, PENDING_KINDS};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 mod slot;
-mod resolve;
-use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF, G_CUR_F, G_CUR_T, G_FIELDS, G_PREVIOUS, G_TERM};
+use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF};
 
 type Res<T> = Result<T, String>;
 
@@ -77,9 +76,6 @@ kernels! {
     leaf,
     reach_sweep,
     backprop_sweep,
-    gadget_seed,
-    gadget_update,
-    choose_gather,
 }
 
 trait LaunchUnit {
@@ -376,10 +372,6 @@ struct Batch {
     base: Wire<i32>,
     prime: Wire<u32>,
     touched: Wire<i32>,
-    focus: Wire<u32>,
-    actual: Wire<u32>,
-    explore: Wire<f32>,
-    out_at: Wire<u32>,
     upto: Vec<Prefix>,
     parts: u32,
     cells: usize,
@@ -397,10 +389,6 @@ impl Default for Batch {
             base: Wire::default(),
             prime: Wire::default(),
             touched: Wire::default(),
-            focus: Wire::default(),
-            actual: Wire::default(),
-            explore: Wire::default(),
-            out_at: Wire::default(),
             upto: vec![Prefix::default()],
             parts: 0,
             cells: 0,
@@ -486,14 +474,13 @@ struct Card {
 }
 
 impl Device {
-    pub fn new(ordinals: &[usize], net: &Net, mut cfg: Cfg, max_slots: usize) -> Res<Device> {
+    pub fn new(ordinals: &[usize], net: &Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
         }
         if net.is_empty() {
             return Err("cannot start the device backend without weights".into());
         }
-        cfg.budget = cfg.budget.storage();
         let budget = cfg.budget;
         let mut cards = Vec::with_capacity(ordinals.len() * PIPELINE);
         let mut left = max_slots;
@@ -663,14 +650,6 @@ impl Device {
             qval: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_QVAL, 0, s.ncells, &mut h)?,
             visits: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_VISITS, 0, s.ncells, &mut h)?,
             reach: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_REACH, 0, s.nreach, &mut h)?,
-            vals: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_VALS, 0, 2 * s.nvals, &mut h)?,
-            carry: c.stream.memcpy_dtov(&s.carry.buf.as_ref().expect("carry storage").slice(..s.carry.len)).map_err(err)?,
-            gadget: if s.ngadget == 0 {
-                Vec::new()
-            } else {
-                let data = s.gadget.buf.as_ref().expect("gadget storage");
-                c.stream.memcpy_dtov(&data.slice(..G_FIELDS * s.ngadget)).map_err(err)?
-            },
         })
     }
 }
@@ -687,9 +666,6 @@ pub struct Resident {
     pub qval: Vec<f32>,
     pub visits: Vec<f32>,
     pub reach: Vec<f32>,
-    pub vals: Vec<f32>,
-    pub carry: Vec<f32>,
-    pub gadget: Vec<f32>,
 }
 
 struct Gpu {
@@ -959,8 +935,7 @@ impl Card {
                 .filter(|&i| calls[i].kind() == kind)
                 .collect()
         };
-        let gadgets = pick(2);
-        let trees = pick(3);
+        let trees = pick(2);
         {
             let mut solves = self.solves.lock();
             for &i in &trees {
@@ -978,7 +953,6 @@ impl Card {
         pack.clear();
         self.trunk(calls, &pick(0), &mut pack).map_err(at("trunk"))?;
         self.configs(calls, &pick(1)).map_err(at("configs"))?;
-        self.gadgets(calls, &gadgets).map_err(at("gadget"))?;
         self.tree(calls, &trees, &mut pack).map_err(at("tree"))?;
         self.scatter(&mut pack).map_err(at("scatter"))?;
         drop(pack);
@@ -990,12 +964,12 @@ impl Card {
             ],
             _ => unreachable!(),
         };
-        let mut iterates = pick(4);
+        let mut iterates = pick(3);
         iterates.sort_unstable_by_key(|&i| rule(i));
         for same in iterates.chunk_by(|a, b| rule(*a) == rule(*b)) {
             self.iterate(calls, same, &mut out).map_err(at("iterate"))?;
         }
-        self.read(calls, &pick(5), &mut out).map_err(at("read"))?;
+        self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
         {
             let solves = self.solves.lock();
             for &slot in &slots {
@@ -1572,7 +1546,7 @@ impl Card {
         }
         let mut g = self.solves.lock();
         for &i in mine {
-            let Call::Tree { solve, writes, ncells, nreach, nvals, root_n, levels, carry, carry_len, nterm, seed, .. }
+            let Call::Tree { solve, writes, ncells, nreach, nvals, levels, nterm, seed, .. }
                 = &calls[i] else {
                 unreachable!("tree shard holds only tree calls")
             };
@@ -1583,14 +1557,8 @@ impl Card {
                 let dst = b.plan(s, r.dst, r.at as usize, r.len as usize)?;
                 pack.piece(dst, r.at, base + r.start, r.len);
             }
-            if b.ngadget > 0 && b.ngadget != root_n[1 - b.resolver as usize] as usize {
-                return Err("gadget support does not match the opponent root support".into());
-            }
             b.level_start.clear();
             b.level_start.extend_from_slice(levels);
-            b.ncarry = carry.len();
-            b.carry_node.put(s, 0, carry)?;
-            b.carry.room(*carry_len)?;
             b.nterm = *nterm;
             if let Some(sd) = seed {
                 b.seed.put(s, 0, &[*sd])?;
@@ -1703,6 +1671,14 @@ impl Card {
         Ok(())
     }
 
+    fn value_pass(&self, b: &Batch) -> Res<()> {
+        let all = b.all();
+        self.reaches(b, all, 1, 0)?;
+        self.network(b, all)?;
+        self.terminals(b.trees.buf(), all)?;
+        self.backprop(b, all, 1, 0, Cfr::LINEAR)
+    }
+
     fn iterate(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
@@ -1751,7 +1727,6 @@ impl Card {
         let b = self.batch.lock();
         self.scratch.lock().queries.room(query_total)?;
 
-        self.gadget_seed(&b).map_err(at("gadget seed"))?;
         self.reaches(&b, b.all(), 0, 0).map_err(at("reach"))?;
         for iter in 0..rounds {
             let live = order
@@ -1787,7 +1762,6 @@ impl Card {
             self.network(&b, p).map_err(at("net"))?;
             self.terminals(b.trees.buf(), p).map_err(at("terminals"))?;
             self.backprop(&b, p, 0, it, k).map_err(at("backprop"))?;
-            self.gadget_update(&b, it, k).map_err(at("iteration summary"))?;
             self.reaches(&b, p, 0, it).map_err(at("reach"))?;
             if sims > 0 {
                 {
@@ -1824,6 +1798,58 @@ impl Card {
             Call::Iterate { iters, expand, .. } => (*iters, *expand),
             _ => unreachable!("iterate shard holds only iterate calls"),
         }
+    }
+
+    fn read(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
+        if mine.is_empty() {
+            return Ok(());
+        }
+        let solves: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
+        self.lay(&solves)?;
+        let mut b = self.batch.lock();
+        let touched: Vec<i32> = mine
+            .iter()
+            .map(|&i| match &calls[i] {
+                Call::Read { touched, .. } => (touched[0] as i32) | ((touched[1] as i32) << 1),
+                _ => unreachable!("read shard holds only read calls"),
+            })
+            .collect();
+        b.touched.put(&self.stream, touched.len(), copy(&touched))?;
+        self.finish(&b, b.all())?;
+
+        let want: Vec<usize> = mine
+            .iter()
+            .filter(|&&i| matches!(&calls[i],
+                Call::Read { vals_at, .. } if vals_at[0].1 > 0 || vals_at[1].1 > 0))
+            .map(|&i| calls[i].solve())
+            .collect();
+        drop(b);
+        if !want.is_empty() {
+            self.lay(&want)?;
+            self.value_pass(&self.batch.lock())?;
+        }
+
+        let g = self.solves.lock();
+        let mut h = self.down_f.lock();
+        for &i in mine {
+            let Call::Read { solve, vals_at, policy_at, .. } = &calls[i] else {
+                unreachable!("read shard holds only read calls")
+            };
+            let s = &g[*solve];
+            let mut root = Vec::new();
+            for &(at, n) in vals_at {
+                root.extend(s.ent[Ent::Reach as usize].get_f32(&self.stream, R_VALS, at as usize, n as usize, &mut h)?);
+            }
+            let policy = s.ent[Ent::Cell as usize].get_f32(
+                &self.stream,
+                C_SUM,
+                policy_at.0 as usize,
+                policy_at.1 as usize,
+                &mut h,
+            )?;
+            out.push((i, Reply { a: root, b: policy, ..Default::default() }));
+        }
+        Ok(())
     }
 
     fn grid(items: u32, split: u32) -> LaunchConfig {
@@ -2004,7 +2030,6 @@ struct Scratch {
     input: Arr<f32>,
     leaves: Arr<u32>,
     queries: Arr<f32>,
-    gathered: Arr<f32>,
     piles: Arr<f32>,
     tokens: Arr<f32>,
     projected: Arr<f32>,
@@ -2064,7 +2089,6 @@ impl Plan {
             input: self.arr(TILE * (2 * C + LOOSE))?,
             leaves: self.arr(n * cfg.s.max(1) as usize)?,
             queries: self.arr(n * b.cap(Ent::Config))?,
-            gathered: self.arr(n * (1 + 4 * crate::pbs::MAX_CONFIG_SUPPORT + b.cap(Ent::Cell)))?,
             piles: self.arr(TILE * NTYPE * PILE_COUNTS)?,
             tokens: self.arr(TILE * NTYPE * TYPE)?,
             projected: self.arr(TILE * NTYPE * C)?,
@@ -2100,10 +2124,6 @@ impl Plan {
             base: self.wire(n)?,
             prime: self.wire(12 * TILE + n * b.cap(Ent::Cell))?,
             touched: self.wire(n)?,
-            focus: self.wire(n)?,
-            actual: self.wire(n)?,
-            explore: self.wire(n)?,
-            out_at: self.wire(n)?,
             ..Batch::default()
         };
         Ok((scratch, stage, batch, self.bytes))

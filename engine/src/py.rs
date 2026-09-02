@@ -83,7 +83,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         ("outcomes", d.outcome.len(), 2 * d.nv),
         ("creation times", d.created.len(), d.nv),
         ("query labels", d.query.len(), d.nv),
-        ("value masks", d.cm.len(), d.cw.len()),
         ("TD(1) labels", d.td1.len(), d.nv),
     ] {
         assert_eq!(got, want, "{name} do not match the row count");
@@ -102,7 +101,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         };
     }
     arrays! {
-        rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, cm = d.cm, coff = d.coff,
+        rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, coff = d.coff,
         pa = d.pa, paoff = d.paoff, pcoff = d.pcoff, pci = d.pci,
         pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome,
         created = d.created, query = d.query, td1 = d.td1, soff = soff,
@@ -121,7 +120,7 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, explore=0.1, random_draft=true, cfr="sog", puct=1.5, prior_temp=1.0, p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
+    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, explore=0.1, random_draft=true, cfr="sog", p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
@@ -133,15 +132,11 @@ impl SolveFarm {
         explore: f32,
         random_draft: bool,
         cfr: &str,
-        puct: f32,
-        prior_temp: f32,
         p_td1: f32,
         query_rate: f32,
         recursive_rate: f32,
         devices: Vec<usize>,
     ) -> PyResult<SolveFarm> {
-        let explore = rate("explore", explore)?;
-        let p_td1 = rate("p_td1", p_td1)?;
         let query_rate = rate("query_rate", query_rate)?;
         let recursive_rate = rate("recursive_rate", recursive_rate)?;
         let cfg = Cfg {
@@ -150,9 +145,8 @@ impl SolveFarm {
             batch,
             rounds,
             cfr: cfr_of(cfr)?,
-            puct,
-            prior_temp,
             budget: Budget::for_s(s),
+            ..Default::default()
         };
         let gc = GameCfg {
             agents: [Agent::Sog { cfg }; 2],
@@ -235,7 +229,7 @@ fn device_for(devices: &[usize], value: &crate::net::Net, cfg: Cfg) -> PyResult<
 }
 
 #[pyfunction]
-#[pyo3(signature = (games, seed, explore=0.1, random_draft=true, temp=2.0))]
+#[pyo3(signature = (games, seed, explore=0.25, random_draft=true, temp=2.0))]
 fn gen_data(
     py: Python<'_>,
     games: usize,

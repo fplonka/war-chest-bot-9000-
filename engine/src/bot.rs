@@ -1,176 +1,169 @@
 use crate::actions::Action;
 use crate::arena::{Draft, Obs};
-use crate::pbs::{belief_after_draw, faceup_counts, reserve, set_config, true_config, Belief, Config, Ctx};
-use crate::policy;
-use crate::resolve::{observed_state, Continuation, PublicState, Solved};
-use crate::state::{Cont, State};
-
-#[cfg(feature = "gpu")]
-use crate::pbs::obs_key;
-#[cfg(feature = "gpu")]
+use crate::pbs::{belief_after_draw, faceup_counts, obs_key, reserve, set_config, true_config, Belief, Config, Ctx};
+use crate::policy::{self, NodePolicy};
 use crate::rng::Rng;
-#[cfg(feature = "gpu")]
-use crate::search::Cfg;
-#[cfg(feature = "gpu")]
-use std::sync::Arc;
 
 #[cfg(feature = "gpu")]
 use crate::farm::Cards;
-#[cfg(feature = "gpu")]
 use crate::net::Net;
 #[cfg(feature = "gpu")]
 use crate::search::{Solver, Step};
+use crate::search::Cfg;
+use crate::state::{Cont, State};
+use std::sync::Arc;
 
-#[cfg(feature = "gpu")]
+#[derive(Clone)]
+pub enum Mind {
+    #[cfg(feature = "gpu")]
+    Sog(Arc<Cards>),
+    Random,
+    Greedy { temp: f32 },
+}
+
 pub struct Brain {
-    pub cards: Arc<Cards>,
+    pub mind: Mind,
     pub net: Arc<Net>,
     pub cfg: Cfg,
 }
 
-#[cfg(feature = "gpu")]
 impl Brain {
-    fn solve(&self, mut solver: Solver) -> Result<Solved, String> {
-        let seat = self.cards.seat();
-        solver.pin(seat.slot);
-        let mut replies = Vec::new();
-        loop {
-            match solver.advance(&replies) {
-                Step::Calls(calls) => {
-                    replies = self.cards.round(seat.lane, calls).ok_or("the GPU solve failed")?;
-                }
-                Step::Done(solved) => return solved.map(|solved| *solved),
-            }
+    #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
+    pub fn policy(&self, s: &State, ctx: &Ctx, player: u8, bel: &[Belief; 2], rng: &mut Rng) -> NodePolicy {
+        let cfgs = &bel[player as usize].cfg;
+        match &self.mind {
+            Mind::Random => policy::uniform(s, ctx, player, cfgs),
+            Mind::Greedy { temp } => policy::greedy(s, ctx, player, cfgs, *temp),
+            #[cfg(feature = "gpu")]
+            Mind::Sog(cards) => self.solve(s, ctx, bel, rng, cards),
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn solve(&self, s: &State, ctx: &Ctx, bel: &[Belief; 2], rng: &mut Rng, cards: &Cards) -> NodePolicy {
+        let mut sv = Solver::new(
+            s,
+            *ctx,
+            Arc::clone(&self.net),
+            self.cfg,
+            bel.clone(),
+            Rng::new(rng.next_u64()),
+        );
+        let seat = cards.seat();
+        sv.pin(seat.slot);
+        let mut replies = Vec::new();
+        while let Step::Calls(calls) = sv.advance(&replies) {
+            replies = cards
+                .round(seat.lane, calls)
+                .expect("a card failed while a solve was still running");
+        }
+        policy::root(&sv)
     }
 }
 
 pub struct Session {
     s: State,
     ctx: Ctx,
+    bel: [Belief; 2],
     seat: u8,
-    belief: [Belief; 2],
-    continuation: Option<Continuation>,
-    refreshed: Option<Solved>,
-    #[cfg(feature = "gpu")]
     rng: Rng,
+    modelled: Option<NodePolicy>,
 }
 
 impl Session {
-    pub fn new(draft: &Draft, seat: u8, _seed: u64) -> Result<Session, String> {
+    pub fn new(draft: &Draft, seat: u8, seed: u64) -> Result<Session, String> {
         let s = draft.state()?;
         let ctx = Ctx::new(&s);
-        let belief = [Belief::point(Config::default()), Belief::point(Config::default())];
-        PublicState::new(s, &belief)?;
         Ok(Session {
             s,
             ctx,
+            bel: [Belief::point(Config::default()), Belief::point(Config::default())],
             seat,
-            belief,
-            continuation: None,
-            refreshed: None,
-            #[cfg(feature = "gpu")]
-            rng: Rng::new(_seed),
+            rng: Rng::new(seed),
+            modelled: None,
         })
     }
 
-    pub fn observe(&mut self, obs: &Obs) -> Result<(), String> {
+    fn resync(&mut self, player: u8) {
+        let stand_in = self.bel[player as usize].cfg[0];
+        set_config(&mut self.s, player, &self.ctx, &stand_in);
+    }
+
+    pub fn watch(&mut self, brain: &Brain) {
+        if !self.s.is_terminal() && !self.s.is_chance() && self.s.to_act() != self.seat {
+            let player = self.s.to_act();
+            self.modelled = Some(brain.policy(&self.s, &self.ctx, player, &self.bel, &mut self.rng));
+        }
+    }
+
+    pub fn observe(&mut self, obs: &Obs, brain: &Brain) -> Result<(), String> {
         match *obs {
             Obs::Draw { player, code } => self.drew(player, code),
-            Obs::Act { player, key } => self.acted(player, key),
+            Obs::Act { player, key } => self.acted(player, key, brain),
         }
     }
 
     fn drew(&mut self, player: u8, code: Option<u32>) -> Result<(), String> {
         if !self.s.is_chance() || self.s.to_act() != player {
-            return Err(format!("player {player} is not drawing"));
+            return Err(format!("player {} is not drawing", player));
         }
-        let legal = self.s.legal_actions();
-        let drawn = match code {
-            Some(code) => Action::decode(code).ok_or_else(|| format!("draw {code} does not decode"))?,
-            None => legal[0],
-        };
-        if !legal.contains(&drawn) {
-            return Err(format!("draw {} is illegal", drawn.encode()));
-        }
-        let p = player as usize;
+        self.modelled = None;
         let res = reserve(&self.s, player, &self.ctx);
         let faceup = faceup_counts(&self.s, player, &self.ctx);
         let in_flight = matches!(self.s.pending(), Cont::WarriorPriestDraw { .. });
-        self.belief[p] = belief_after_draw(&self.belief[p], &res, &faceup, in_flight);
-        let mut state = self.s;
-        state.apply_inplace(drawn);
-        let more = matches!(state.pending(), Cont::Draw { .. }) && state.to_act() == player;
-        if !more {
-            if let Some(continuation) = self.continuation.as_mut() {
-                continuation.draws += 1;
-            }
+        self.bel[player as usize] = belief_after_draw(&self.bel[player as usize], &res, &faceup, in_flight);
+        let drawn = match code {
+            Some(code) => Action::decode(code).ok_or_else(|| format!("draw {} does not decode", code))?,
+            None => self.s.legal_actions()[0],
+        };
+        self.s.apply_inplace(drawn);
+        if player != self.seat {
+            self.resync(player);
         }
-        self.s = state;
         Ok(())
     }
 
-    fn acted(&mut self, player: u8, key: u32) -> Result<(), String> {
+    fn acted(&mut self, player: u8, key: u32, brain: &Brain) -> Result<(), String> {
         if self.s.is_terminal() || self.s.is_chance() || self.s.to_act() != player {
-            return Err(format!("player {player} is not to act"));
+            return Err(format!("player {} is not to act", player));
         }
         if player == self.seat {
-            return Err("a bot is told its own move back".into());
+            return Err("a bot is told its own moves back".into());
         }
-        let p = player as usize;
-        let own = true_config(&self.s, self.seat, &self.ctx);
-        let mut state = observed_state(&self.s, &self.belief[p].cfg, key)?;
-        set_config(&mut state, self.seat, &self.ctx, &own);
-        self.continuation = match self.refreshed.take() {
-            Some(solved) => solved.advance(&mut self.belief, &self.ctx, 0.0, key)?,
-            None => {
-                let model = policy::uniform(&self.s, &self.ctx, player, &self.belief[p].cfg);
-                self.belief[p] = model.posterior(&self.belief[p], key);
-                None
-            }
+        let np = match self.modelled.take() {
+            Some(np) => np,
+            None => brain.policy(&self.s, &self.ctx, player, &self.bel, &mut self.rng),
         };
-        self.s = state;
+        let (ci, cell) = np
+            .cell_for(key)
+            .ok_or_else(|| format!("observation {} is unreachable from this belief", key))?;
+        let posterior = np.posterior(&self.bel[player as usize], key);
+        set_config(&mut self.s, player, &self.ctx, &self.bel[player as usize].cfg[ci]);
+        self.s.apply_inplace(np.acts[np.action_at(cell)]);
+        self.bel[player as usize] = posterior;
+        self.resync(player);
         Ok(())
     }
 
-    #[cfg(feature = "gpu")]
-    pub fn watch(&mut self, brain: &Brain) -> Result<(), String> {
-        if self.s.is_terminal() || self.s.is_chance() || self.s.to_act() == self.seat || self.refreshed.is_some() {
-            return Ok(());
-        }
-        let solver = Solver::refresh(
-            self.continuation.as_ref(),
-            &self.s,
-            self.ctx,
-            Arc::clone(&brain.net),
-            brain.cfg,
-            self.belief.clone(),
-            Rng::new(self.rng.next_u64()),
-        )?;
-        self.refreshed = Some(brain.solve(solver)?);
-        self.continuation = None;
-        Ok(())
-    }
-
-    #[cfg(feature = "gpu")]
     pub fn decide(&mut self, brain: &Brain) -> Result<u32, String> {
         if self.s.is_terminal() || self.s.is_chance() || self.s.to_act() != self.seat {
             return Err("the bot was asked to move out of turn".into());
         }
-        let actual = true_config(&self.s, self.seat, &self.ctx);
-        let solver = Solver::play(
-            self.continuation.as_ref(),
-            &self.s,
-            self.ctx,
-            Arc::clone(&brain.net),
-            brain.cfg,
-            self.belief.clone(),
-            Rng::new(self.rng.next_u64()),
-            actual,
-        )?;
-        let solved = brain.solve(solver)?;
-        let action = solved.action.ok_or("a play solve chose no action")?;
-        self.continuation = solved.advance(&mut self.belief, &self.ctx, 0.0, obs_key(&action))?;
+        self.modelled = None;
+        let truth = true_config(&self.s, self.seat, &self.ctx);
+        let ci = self.bel[self.seat as usize]
+            .index_of(&truth)
+            .ok_or("the belief filter dropped this seat's own config")?;
+        let np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel, &mut self.rng);
+        if np.row(ci).is_empty() {
+            return Err(format!(
+                "this seat's hand has no legal action here ({} actions at the node)",
+                np.acts.len()
+            ));
+        }
+        let cell = np.sample(&mut self.rng, ci);
+        let action = np.acts[np.action_at(cell)];
+        self.bel[self.seat as usize] = np.posterior(&self.bel[self.seat as usize], obs_key(&action));
         self.s.apply_inplace(action);
         Ok(action.encode())
     }
@@ -178,9 +171,10 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
-    use crate::pbs::{obs_key, uniform_belief};
-    use crate::resolve::Values;
+    use crate::arena::{Done, Reply, Table};
 
     fn draft() -> Draft {
         Draft {
@@ -190,66 +184,153 @@ mod tests {
         }
     }
 
-    fn facing_the_opponent() -> Session {
-        let mut session = Session::new(&draft(), 1, 9).unwrap();
-        while session.s.is_chance() {
-            let player = session.s.to_act();
-            session.drew(player, None).unwrap();
+    fn brain() -> Brain {
+        Brain {
+            mind: Mind::Random,
+            net: Arc::new(Net::default()),
+            cfg: Cfg::default(),
         }
-        session.seat = 1 - session.s.to_act();
-        session
     }
 
-    #[test]
-    fn observation_has_no_policy_input() {
-        let session = Session::new(&draft(), 0, 7).unwrap();
-        let _observe: fn(&mut Session, &Obs) -> Result<(), String> = Session::observe;
-        assert!(session.continuation.is_none() && session.refreshed.is_none());
-    }
-
-    #[test]
-    fn lifecycle_error_does_not_advance_the_session() {
-        let mut session = facing_the_opponent();
-        let state = session.s;
-        let belief = session.belief.clone();
-        let player = session.s.to_act();
-        assert!(session.acted(player, u32::MAX).is_err());
-        assert_eq!(session.s, state);
-        assert_eq!(session.belief[0].cfg, belief[0].cfg);
-        assert_eq!(session.belief[1].cfg, belief[1].cfg);
-    }
-
-    #[test]
-    fn an_opponent_action_before_a_refresh_is_filtered_under_a_uniform_model() {
-        let mut session = facing_the_opponent();
-        let player = session.s.to_act();
-        let prior = session.belief[player as usize].clone();
-        let key = obs_key(&session.s.legal_actions()[0]);
-        let want = policy::uniform(&session.s, &session.ctx, player, &prior.cfg).posterior(&prior, key);
-        session.acted(player, key).unwrap();
-        assert!(session.continuation.is_none());
-        assert_eq!(session.belief[player as usize].cfg, want.cfg);
-        assert_eq!(session.belief[player as usize].p, want.p);
-    }
-
-    #[test]
-    fn a_stale_boundary_does_not_survive_an_unrefreshed_opponent_action() {
-        let mut session = facing_the_opponent();
-        let range = [
-            uniform_belief(&session.s, &session.ctx, 0),
-            uniform_belief(&session.s, &session.ctx, 1),
+    fn play(seed: u64, mut inspect: impl FnMut(&Session)) -> f32 {
+        let brain = brain();
+        let mut table = Table::new();
+        table.start(1, &draft(), [0, 1], seed).unwrap();
+        let mut seats = [
+            Session::new(&draft(), 0, seed ^ 11).unwrap(),
+            Session::new(&draft(), 1, seed ^ 22).unwrap(),
         ];
-        let values = Values {
-            state: session.s,
-            cfgs: [range[0].cfg.clone(), range[1].cfg.clone()],
-            cfv: [vec![0.0; range[0].len()], vec![0.0; range[1].len()]],
-        };
-        session.belief = range.clone();
-        session.continuation = Some(Continuation::new(values, range.clone()).unwrap());
-        let player = session.s.to_act();
-        let key = obs_key(&session.s.legal_actions()[0]);
-        session.observe(&Obs::Act { player, key }).unwrap();
-        assert!(session.continuation.is_none());
-        assert_eq!(session.belief[1 - player as usize].p, range[1 - player as usize].p);
+        let mut waiting: [HashSet<u32>; 2] = [HashSet::new(), HashSet::new()];
+        loop {
+            table.settle();
+            if let Some(&(_, _, z)) = table.reap().first() {
+                return z;
+            }
+            for bot in 0..2 {
+                let request = table.request(bot);
+                for id in &request.drop {
+                    assert!(
+                        !waiting[bot].contains(id),
+                        "game {} dropped while bot {} was still answering about it",
+                        id,
+                        bot
+                    );
+                }
+                let mut done = Vec::new();
+                for ask in request.watch {
+                    waiting[bot].insert(ask.id);
+                    for obs in &ask.obs {
+                        seats[bot].observe(obs, &brain).unwrap();
+                    }
+                    seats[bot].watch(&brain);
+                    done.push(Done {
+                        id: ask.id,
+                        action: None,
+                    });
+                }
+                for ask in request.go {
+                    waiting[bot].insert(ask.id);
+                    for obs in &ask.obs {
+                        seats[bot].observe(obs, &brain).unwrap();
+                    }
+                    inspect(&seats[bot]);
+                    done.push(Done {
+                        id: ask.id,
+                        action: Some(seats[bot].decide(&brain).unwrap()),
+                    });
+                }
+                for entry in &done {
+                    waiting[bot].remove(&entry.id);
+                }
+                table.accept(bot, Reply { done, error: None }).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_seat_keeps_its_own_config_in_support() {
+        play(77, |sess| {
+            let truth = true_config(&sess.s, sess.seat, &sess.ctx);
+            assert!(
+                sess.bel[sess.seat as usize].index_of(&truth).is_some(),
+                "seat {} lost its own config",
+                sess.seat
+            );
+        });
+    }
+
+    #[test]
+    fn a_seat_is_told_nothing_private() {
+        let brain = brain();
+        let mut table = Table::new();
+        table.start(1, &draft(), [0, 1], 8191).unwrap();
+        let mut seats = [
+            Session::new(&draft(), 0, 1).unwrap(),
+            Session::new(&draft(), 1, 2).unwrap(),
+        ];
+        let mut checked = 0;
+        for _ in 0..60 {
+            table.settle();
+            if !table.reap().is_empty() {
+                break;
+            }
+            for bot in 0..2 {
+                let request = table.request(bot);
+                let mut done = Vec::new();
+                for (ask, acting) in request
+                    .watch
+                    .into_iter()
+                    .map(|a| (a, false))
+                    .chain(request.go.into_iter().map(|a| (a, true)))
+                {
+                    for obs in &ask.obs {
+                        match *obs {
+                            Obs::Draw { player, code } => {
+                                if player != bot as u8 {
+                                    assert!(code.is_none(), "seat {} was shown the other's draw", bot);
+                                    checked += 1;
+                                }
+                            }
+                            Obs::Act { player, key } => {
+                                assert_ne!(player, bot as u8);
+                                if let Some(action) = Action::decode(key) {
+                                    assert_eq!(obs_key(&action), key, "an observation carried more than was seen");
+                                }
+                                checked += 1;
+                            }
+                        }
+                        seats[bot].observe(obs, &brain).unwrap();
+                    }
+                    if acting {
+                        let action = seats[bot].decide(&brain).unwrap();
+                        done.push(Done {
+                            id: ask.id,
+                            action: Some(action),
+                        });
+                    } else {
+                        seats[bot].watch(&brain);
+                        done.push(Done {
+                            id: ask.id,
+                            action: None,
+                        });
+                    }
+                }
+                table.accept(bot, Reply { done, error: None }).unwrap();
+            }
+        }
+        assert!(checked > 20, "the game was too short to have tested anything");
+    }
+
+    #[test]
+    fn the_opponents_stand_in_stays_in_support() {
+        play(1009, |sess| {
+            let other = 1 - sess.seat;
+            let stand_in = true_config(&sess.s, other, &sess.ctx);
+            assert!(
+                sess.bel[other as usize].index_of(&stand_in).is_some(),
+                "the stand-in for seat {} left the belief",
+                other
+            );
+        });
     }
 }

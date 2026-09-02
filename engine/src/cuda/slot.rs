@@ -28,9 +28,8 @@ pub fn tree_source() -> String {
     for c in &TABLE {
         out += &format!("    {} {};\n", c.ty, c.name);
     }
-    for tail in ["unsigned long long* seed", "float* gadget", "float* carry", "const unsigned int* carry_node",
-                 "unsigned long long ngadget", "unsigned long long resolver", "unsigned long long ncarry",
-                 "unsigned long long nterm", "unsigned long long nvals", "unsigned long long step",
+    for tail in ["unsigned long long* seed", "unsigned long long nterm",
+                 "unsigned long long nvals", "unsigned long long step",
                  "unsigned long long todo", "unsigned long long nexpand"] {
         out += &format!("    {tail};\n");
     }
@@ -93,7 +92,7 @@ const TABLE: [Col; 53] = [
     Col { ent: Ent::Row, width: 1, dst: Some(Dst::Term), name: "term", ty: CU },
 ];
 
-pub const DESC: usize = TABLE.len() + 12;
+pub const DESC: usize = TABLE.len() + 6;
 
 const fn fields() -> [usize; 8] {
     let mut f = [0; 8];
@@ -337,21 +336,9 @@ impl Entity {
     }
 }
 
-pub const G_PREVIOUS: usize = 0;
-pub const G_TERM: usize = 1;
-pub const G_CUR_T: usize = 4;
-pub const G_CUR_F: usize = 5;
-pub const G_FIELDS: usize = 6;
-
 pub struct Solve {
     pub ready: cudarc::driver::CudaEvent,
     pub ent: [Entity; 8],
-    pub gadget: Arr<f32>,
-    pub carry: Arr<f32>,
-    pub carry_node: Arr<u32>,
-    pub ngadget: usize,
-    pub ncarry: usize,
-    pub resolver: u8,
     pub host_coff: Vec<u32>,
     pub cells: usize,
     pub rows: usize,
@@ -387,12 +374,6 @@ impl Solve {
                 Entity::with_cap(s, b.cap(Ent::Config), FIELDS[Ent::Config as usize])?,
                 Entity::with_cap(s, b.cap(Ent::Cidx), FIELDS[Ent::Cidx as usize])?,
             ],
-            gadget: Arr::with_cap(s, G_FIELDS * crate::pbs::MAX_CONFIG_SUPPORT)?,
-            carry: Arr::with_cap(s, 2 * b.cap(Ent::Reach))?,
-            carry_node: Arr::with_cap(s, b.cap(Ent::Node))?,
-            ngadget: 0,
-            ncarry: 0,
-            resolver: 0,
             host_coff: vec![0],
             cells: 0,
             rows: 0,
@@ -418,9 +399,6 @@ impl Solve {
     }
 
     pub fn rewind(&mut self, s: &Arc<CudaStream>) -> Res<()> {
-        self.ngadget = 0;
-        self.ncarry = 0;
-        self.resolver = 0;
         self.cells = 0;
         self.rows = 0;
         self.host_coff.clear();
@@ -441,18 +419,11 @@ impl Solve {
         self.ent[Ent::Draw as usize].rewind();
         self.ent[Ent::Cell as usize].zero(s)?;
         self.ent[Ent::Reach as usize].zero(s)?;
-        if let Some(carry) = self.carry.buf.as_mut() {
-            s.memset_zeros(carry).map_err(err)?;
-        }
-        self.carry.len = 0;
         Ok(())
     }
 
     pub fn bytes(&self) -> usize {
-        self.ent.iter().map(Entity::bytes).sum::<usize>()
-            + self.seed.cap * 8
-            + (self.gadget.cap + self.carry.cap) * 4
-            + self.carry_node.cap * 4
+        self.ent.iter().map(Entity::bytes).sum::<usize>() + self.seed.cap * 8
     }
 
     pub fn copy_board(
@@ -516,17 +487,11 @@ impl Solve {
             i += 1;
         }
         out[i] = self.seed.ptr(s);
-        out[i + 1] = self.gadget.ptr(s);
-        out[i + 2] = self.carry.ptr(s);
-        out[i + 3] = self.carry_node.ptr(s);
-        out[i + 4] = self.ngadget as u64;
-        out[i + 5] = self.resolver as u64;
-        out[i + 6] = self.ncarry as u64;
-        out[i + 7] = self.nterm as u64;
-        out[i + 8] = self.nvals as u64;
-        out[i + 9] = self.step as u64;
-        out[i + 10] = self.todo as u64;
-        out[i + 11] = self.nexpand as u64;
+        out[i + 1] = self.nterm as u64;
+        out[i + 2] = self.nvals as u64;
+        out[i + 3] = self.step as u64;
+        out[i + 4] = self.todo as u64;
+        out[i + 5] = self.nexpand as u64;
         out
     }
 }
