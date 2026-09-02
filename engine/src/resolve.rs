@@ -1,5 +1,6 @@
 use crate::actions::Action;
-use crate::pbs::{obs_key, pack_row, reserve, set_config, true_config, Belief, Config, Ctx, NSLOT, ROW_BYTES};
+use crate::pbs::{action_legal, obs_key, pack_row, reserve, set_config, true_config, Belief, Config, Ctx, NSLOT, ROW_BYTES};
+use crate::policy::NodePolicy;
 use crate::search::Policy;
 use crate::state::State;
 
@@ -98,64 +99,56 @@ impl PartialEq for PublicState {
 impl Eq for PublicState {}
 
 #[derive(Clone, Debug)]
-pub struct Boundary {
-    pub public: PublicState,
-    pub range: [Belief; 2],
+pub struct Values {
+    pub state: State,
+    pub cfgs: [Vec<Config>; 2],
     pub cfv: [Vec<f32>; 2],
 }
 
-impl Boundary {
-    pub fn new(state: State, range: [Belief; 2], cfv: [Vec<f32>; 2]) -> Result<Self, String> {
-        let public = PublicState::new(state, &range)?;
+pub struct Solved {
+    pub action: Option<Action>,
+    pub policy: Policy,
+    pub focus: Values,
+    pub children: Vec<(u32, Values)>,
+    pub queries: Vec<(State, [Belief; 2])>,
+}
+
+impl Solved {
+    pub fn advance(&self, belief: &mut [Belief; 2], ctx: &Ctx, explore: f32, key: u32) -> Result<Option<Continuation>, String> {
         for p in 0..2 {
-            if range[p].cfg.len() != cfv[p].len() || cfv[p].iter().any(|x| !x.is_finite()) {
-                return Err(format!("player {p} boundary values are invalid"));
+            if belief[p].cfg != self.focus.cfgs[p] {
+                return Err(format!("player {p} belief support differs from the solved focus"));
             }
         }
-        Ok(Self { public, range, cfv })
+        let actor = self.focus.state.to_act() as usize;
+        let mut model = NodePolicy::of(&self.focus.state, ctx, actor as u8, &belief[actor].cfg, &self.policy);
+        model.mix_uniform(explore);
+        belief[actor] = model.posterior(&belief[actor], key);
+        self.children
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, child)| Continuation::new(child.clone(), belief.clone()))
+            .transpose()
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PublicStep {
-    Act(u32),
-    Chance,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ResolvePath {
-    pub steps: Vec<PublicStep>,
-}
-
 #[derive(Clone, Debug)]
-pub enum Continuation {
-    Unsolved([Belief; 2]),
-    Solved { boundary: Box<Boundary>, path: ResolvePath },
+pub struct Continuation {
+    pub state: State,
+    pub range: [Belief; 2],
+    pub cfv: [Vec<f32>; 2],
+    pub draws: usize,
 }
 
-pub struct PlaySolved {
-    pub action: Action,
-    pub policy: Policy,
-    pub focus: Boundary,
-    pub next: Option<Boundary>,
-    pub queries: Vec<(State, [Belief; 2])>,
-}
-
-pub struct RefreshSolved {
-    pub focus: Boundary,
-    pub queries: Vec<(State, [Belief; 2])>,
-}
-
-pub struct TargetSolved {
-    pub policy: Policy,
-    pub values: [Vec<f32>; 2],
-    pub queries: Vec<(State, [Belief; 2])>,
-}
-
-pub enum SolveOutput {
-    Play(Box<PlaySolved>),
-    Refresh(Box<RefreshSolved>),
-    Target(Box<TargetSolved>),
+impl Continuation {
+    pub fn new(values: Values, range: [Belief; 2]) -> Result<Self, String> {
+        for p in 0..2 {
+            if range[p].cfg != values.cfgs[p] {
+                return Err(format!("player {p} belief support differs from the solved support"));
+            }
+        }
+        Ok(Self { state: values.state, range, cfv: values.cfv, draws: 0 })
+    }
 }
 
 pub fn gadget_iteration(
@@ -196,39 +189,29 @@ pub fn gadget_iteration(
     }
 }
 
-pub fn apply_public_observation(public: &PublicState, prior: &Belief, key: u32) -> Result<(PublicState, Belief), String> {
-    let state = public.state();
+pub fn observed_state(state: &State, support: &[Config], key: u32) -> Result<State, String> {
     if state.is_terminal() || state.is_chance() {
         return Err("an action observation requires a live decision".into());
     }
-    let ctx = Ctx::new(&state);
+    let ctx = Ctx::new(state);
     let actor = state.to_act();
-    let support = &prior.cfg;
-    if support.is_empty() || support.windows(2).any(|w| w[0] >= w[1]) {
-        return Err("action observation support is empty, duplicated, or unsorted".into());
-    }
-    let (acts, slots, facedown) = crate::search::node_actions(&state, actor, &ctx, support);
+    let (acts, slots, _) = crate::search::node_actions(state, actor, &ctx, support);
     let mut found: Option<PublicState> = None;
-    let mut reached: Vec<(Config, f32)> = Vec::new();
-    for ((a, slot), facedown) in acts.into_iter().zip(slots).zip(facedown) {
-        if obs_key(&a) != key {
+    for (a, slot) in acts.iter().zip(slots) {
+        if obs_key(a) != key {
             continue;
         }
-        for (c, mass) in support.iter().zip(&prior.p) {
-            let Some(config) = crate::pbs::advance_config(c, slot, facedown) else { continue };
-            let mut next = state;
-            set_config(&mut next, actor, &ctx, c);
-            next.apply_inplace(a);
-            let candidate = PublicState::from_state(next);
-            if found.as_ref().is_some_and(|old| old != &candidate) {
-                return Err(format!("observation {key} has ambiguous public effects"));
-            }
-            found = Some(candidate);
-            reached.push((config, *mass));
+        let rep = support.iter().find(|c| action_legal(c, slot)).expect("a kept action is playable by some config");
+        let mut next = *state;
+        set_config(&mut next, actor, &ctx, rep);
+        next.apply_inplace(*a);
+        let candidate = PublicState::from_state(next);
+        if found.as_ref().is_some_and(|old| old != &candidate) {
+            return Err(format!("observation {key} has ambiguous public effects"));
         }
+        found = Some(candidate);
     }
-    let posterior = Belief::from_pairs(reached);
-    found.map(|public| (public, posterior))
+    found.map(|public| public.state())
         .ok_or_else(|| format!("observation {key} is structurally unreachable"))
 }
 

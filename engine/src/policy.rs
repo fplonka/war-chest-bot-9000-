@@ -42,6 +42,12 @@ impl NodePolicy {
         }
     }
 
+    pub fn of(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], policy: &Policy) -> NodePolicy {
+        let mut np = Self::frame(s, ctx, player, cfgs);
+        np.probs.copy_from_slice(&policy.p);
+        np
+    }
+
     #[inline]
     pub fn row(&self, c: usize) -> Range<usize> {
         self.legal_off[c] as usize..self.legal_off[c + 1] as usize

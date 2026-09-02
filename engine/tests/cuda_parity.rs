@@ -8,8 +8,8 @@ use warchest::contract::{Call, Reply};
 use warchest::net::Net;
 use warchest::pbs::{expand_row, obs_key, pack_row, true_config, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
-use warchest::resolve::{gadget_iteration, SolveOutput};
-use warchest::search::{Budget, Cfg, Cfr, Policy, Solver, Step};
+use warchest::resolve::{gadget_iteration, PublicState, Solved};
+use warchest::search::{Budget, Cfg, Cfr, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 
 struct Backend(TestDevice);
@@ -194,7 +194,7 @@ fn generate(
     out.into_iter().map(|data| Run { data }).collect()
 }
 
-fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Result<SolveOutput, String>) {
+fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Result<Box<Solved>, String>) {
     sv.pin(0);
     let mut replies: Vec<Reply> = Vec::new();
     loop {
@@ -203,14 +203,6 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Result<SolveOutput, 
             Step::Calls(calls) => replies = backend.run(&calls, 0).expect("the backend answered"),
             Step::Done(solved) => return (sv, solved),
         }
-    }
-}
-
-fn policy(solved: &SolveOutput) -> &Policy {
-    match solved {
-        SolveOutput::Play(s) => &s.policy,
-        SolveOutput::Target(s) => &s.policy,
-        SolveOutput::Refresh(_) => panic!("refresh has no policy"),
     }
 }
 
@@ -231,7 +223,7 @@ fn fresh_batched_solves_use_supplied_beliefs_for_their_first_priors() {
         let state = seed.nodes[0].state;
         let actor = state.to_act();
         let actual = true_config(&state, actor, &Ctx::new(&state));
-        let mut sv = Solver::initial_play(&state, Ctx::new(&state),
+        let mut sv = Solver::play(None, &state, Ctx::new(&state),
             Arc::clone(&net), cfg, belief, Rng::new(0xB3113F + i as u64), actual).unwrap();
         sv.pin(i);
         let Step::Calls(fresh) = sv.advance(&[]) else { panic!("a fresh solve asks for work") };
@@ -274,9 +266,9 @@ fn a_solve_may_change_pipeline_streams() {
             }
             Step::Done(got) => {
                 let got = got.expect("a finished solve");
-                assert_eq!(policy(&want).off, policy(&got).off);
-                assert_eq!(policy(&want).act, policy(&got).act);
-                let bad = worst(&policy(&want).p, &policy(&got).p, "root policy");
+                assert_eq!(want.policy.off, got.policy.off);
+                assert_eq!(want.policy.act, got.policy.act);
+                let bad = worst(&want.policy.p, &got.policy.p, "root policy");
                 assert!(bad < 1e-6, "the policy changed across streams by {bad:e}");
                 break;
             }
@@ -347,7 +339,7 @@ fn shared_round(
     backend: &Backend,
     live: &mut [Solver],
     replies: &mut [Vec<Reply>],
-) -> Option<(usize, Result<SolveOutput, String>)> {
+) -> Option<(usize, Result<Box<Solved>, String>)> {
     let mut calls: Vec<Call> = Vec::new();
     let mut spans = vec![0usize; live.len()];
     for (i, sv) in live.iter_mut().enumerate() {
@@ -463,10 +455,7 @@ fn played_session_carries_across_a_round_boundary() {
             }
         };
         assert_eq!(saw_gadget, decision > 0);
-        let round = match solved.as_ref().expect("valid solve") {
-            SolveOutput::Play(play) => play.focus.public.state().round,
-            _ => unreachable!(),
-        };
+        let round = solved.as_ref().expect("valid solve").focus.state.round;
         let initial = *first_round.get_or_insert(round);
         stream.keep(&solver, solved, &mut data);
         if round > initial {
@@ -487,16 +476,17 @@ fn explored_actions_retain_coherent_boundaries() {
     let mut data = Data::default();
     let solver = stream.next_solve(&net, &mut data);
     let (solver, solved) = run_solve(&device, solver);
-    let SolveOutput::Play(play) = solved.as_ref().expect("a solved play") else { panic!("a play result") };
-    let retained = play.next.as_ref().expect("the explored child is live");
-    let expected_public = retained.public.clone();
-    let state = play.focus.public.state();
+    let play = solved.as_ref().expect("a solved play");
+    let key = obs_key(&play.action.expect("a play solve chooses an action"));
+    let retained = &play.children.iter().find(|(k, _)| *k == key).expect("the explored child is live").1;
+    let state = play.focus.state;
     let actor = state.to_act() as usize;
-    assert!(!retained.public.state().is_chance());
-    assert_ne!(retained.public.state().to_act() as usize, actor);
-    let prior = &play.focus.range[actor];
+    assert!(!retained.state.is_chance());
+    assert_ne!(retained.state.to_act() as usize, actor);
+    let prior = stream.belief()[actor].clone();
     let behavior = warchest::policy::uniform(&state, &Ctx::new(&state), actor as u8, &prior.cfg);
-    let expected_range = behavior.posterior(prior, obs_key(&play.action));
+    let expected_range = behavior.posterior(&prior, key);
+    let expected_public = PublicState::from_state(retained.state);
     stream.keep(&solver, solved, &mut data);
     let mut next = stream.next_solve(&net, &mut data);
     let Step::Calls(calls) = next.advance(&[]) else { panic!("a re-solve starts") };
@@ -513,13 +503,16 @@ fn explored_actions_retain_coherent_boundaries() {
     let mut solver = stream.next_solve(&net, &mut data);
     for _ in 0..64 {
         let (finished, solved) = run_solve(&device, solver);
-        let SolveOutput::Play(play) = solved.as_ref().expect("a solved play") else { panic!("a play result") };
-        let root = play.focus.public.clone();
-        let chance = play.next.as_ref().is_some_and(|boundary| boundary.public.state().is_chance());
+        let play = solved.as_ref().expect("a solved play");
+        let key = obs_key(&play.action.expect("a play solve chooses an action"));
+        let chance = play.children.iter().find(|(k, _)| *k == key)
+            .filter(|(_, child)| child.state.is_chance())
+            .map(|(_, child)| PublicState::from_state(child.state));
         stream.keep(&finished, solved, &mut data);
         solver = stream.next_solve(&net, &mut data);
-        if chance {
-            assert!(root.same_public(&solver.nodes[0].state));
+        if let Some(chance) = chance {
+            assert!(chance.same_public(&solver.nodes[0].state));
+            assert!(solver.nodes[0].chance);
             return;
         }
     }
@@ -593,7 +586,7 @@ fn cfr_average_uses_the_evaluated_strategy() {
     let so = one.nodes[0].soff as usize;
     let initial = one.cur[so + row.start..so + row.end].to_vec();
     let solved = run_solve(&device, one).1.expect("one-update solve");
-    assert!(worst(&initial, &policy(&solved).p[..initial.len()], "one-update average") < 2e-6);
+    assert!(worst(&initial, &solved.policy.p[..initial.len()], "one-update average") < 2e-6);
 }
 
 #[test]

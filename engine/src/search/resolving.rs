@@ -1,9 +1,11 @@
 use super::*;
-use crate::resolve::Continuation;
+use crate::resolve::{Continuation, Solved, Values};
 
 impl Solver {
-    pub fn initial_play(
-        root: &State,
+    #[allow(clippy::too_many_arguments)]
+    pub fn play(
+        continuation: Option<&Continuation>,
+        live: &State,
         ctx: Ctx,
         net: Arc<Net>,
         cfg: Cfg,
@@ -11,55 +13,19 @@ impl Solver {
         rng: Rng,
         actual: Config,
     ) -> Result<Solver, String> {
-        let mut sv = Self::build(root, ctx, net, cfg, belief, rng, Finish::Play(actual))?;
-        sv.prepare_focus()?;
-        Ok(sv)
-    }
-
-    pub fn play(
-        continuation: &Continuation,
-        live: &State,
-        ctx: Ctx,
-        net: Arc<Net>,
-        cfg: Cfg,
-        belief: [Belief; 2],
-        mut rng: Rng,
-        actual: Config,
-    ) -> Result<Solver, String> {
-        Self::continual(continuation, live, ctx, net, cfg, belief, &mut rng, Finish::Play(actual))
+        Self::continual(continuation, live, ctx, net, cfg, belief, rng, Finish::Play(actual))
     }
 
     pub fn refresh(
-        continuation: &Continuation,
+        continuation: Option<&Continuation>,
         live: &State,
         ctx: Ctx,
         net: Arc<Net>,
         cfg: Cfg,
         belief: [Belief; 2],
-        mut rng: Rng,
+        rng: Rng,
     ) -> Result<Solver, String> {
-        Self::continual(continuation, live, ctx, net, cfg, belief, &mut rng, Finish::Refresh)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn continual(
-        continuation: &Continuation,
-        live: &State,
-        ctx: Ctx,
-        net: Arc<Net>,
-        cfg: Cfg,
-        belief: [Belief; 2],
-        rng: &mut Rng,
-        finish: Finish,
-    ) -> Result<Solver, String> {
-        if let Continuation::Solved { boundary, path } = continuation {
-            return Self::resolved(
-                boundary.as_ref().clone(), path.clone(), live,
-                net, cfg, Rng::new(rng.next_u64()), finish);
-        }
-        let mut sv = Self::build(live, ctx, net, cfg, belief, Rng::new(rng.next_u64()), finish)?;
-        sv.prepare_focus()?;
-        Ok(sv)
+        Self::continual(continuation, live, ctx, net, cfg, belief, rng, Finish::Refresh)
     }
 
     pub fn target(
@@ -74,6 +40,25 @@ impl Solver {
             return Err("a target solve requires a valued state".into());
         }
         let mut sv = Self::build(root, ctx, net, cfg, belief, rng, Finish::Target)?;
+        sv.prepare_focus()?;
+        Ok(sv)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn continual(
+        continuation: Option<&Continuation>,
+        live: &State,
+        ctx: Ctx,
+        net: Arc<Net>,
+        cfg: Cfg,
+        belief: [Belief; 2],
+        rng: Rng,
+        finish: Finish,
+    ) -> Result<Solver, String> {
+        let mut sv = match continuation {
+            Some(continuation) => Self::resolved(continuation, live, net, cfg, rng, finish)?,
+            None => Self::build(live, ctx, net, cfg, belief, rng, finish)?,
+        };
         sv.prepare_focus()?;
         Ok(sv)
     }
@@ -120,71 +105,41 @@ impl Solver {
     }
 
     fn resolved(
-        boundary: Boundary,
-        path: ResolvePath,
+        continuation: &Continuation,
         live: &State,
         net: Arc<Net>,
         cfg: Cfg,
         rng: Rng,
         finish: Finish,
     ) -> Result<Solver, String> {
-        let ctx = Ctx::new(&boundary.public.state());
+        let root = continuation.state;
         let resolver = live.to_act();
-        let opponent = 1 - resolver;
-        let previous = boundary.range[opponent as usize].p.clone();
-        let terminate = boundary.cfv[opponent as usize].clone();
-        let root = boundary.public.state();
-        let belief = boundary.range.clone();
-        let mut sv = Self::build(&root, ctx, net, cfg, belief, rng, finish)?;
-        sv.gadget = Some(Gadget { resolver, previous, terminate });
-        sv.follow_path(&path)?;
-        if !boundary.public.same_public(&sv.nodes[0].state) {
-            return Err("the retained boundary does not match its canonical root".into());
-        }
+        let opponent = 1 - resolver as usize;
+        let mut sv = Self::build(&root, Ctx::new(&root), net, cfg, continuation.range.clone(), rng, finish)?;
+        sv.gadget = Some(Gadget { resolver, terminate: continuation.cfv[opponent].clone() });
+        sv.follow_draws(continuation.draws)?;
         if !PublicState::from_state(sv.nodes[sv.focus].state).same_public(live) {
-            return Err("the forced public prefix does not reach the live state".into());
+            return Err("the retained boundary does not reach the live state".into());
         }
         if sv.nodes[sv.focus].player != resolver {
-            return Err("the forced public prefix reaches the wrong actor".into());
+            return Err("the retained boundary reaches the wrong actor".into());
         }
-        sv.prepare_focus()?;
         Ok(sv)
     }
 
-    fn follow_path(&mut self, path: &ResolvePath) -> Result<(), String> {
+    fn follow_draws(&mut self, draws: usize) -> Result<(), String> {
         let mut node = 0usize;
-        for step in &path.steps {
+        for _ in 0..draws {
             if self.nodes[node].leaf {
                 if !self.nodes[node].expandable {
-                    return Err("the mandatory public prefix exceeds solve capacity".into());
+                    return Err("the retained chance transition exceeds solve capacity".into());
                 }
                 self.expand_required(node)?;
             }
-            let next = match *step {
-                PublicStep::Chance => {
-                    if !self.nodes[node].chance || self.nodes[node].child.len() != 1 {
-                        return Err("the mandatory chance transition is missing".into());
-                    }
-                    self.nodes[node].child[0]
-                }
-                PublicStep::Act(key) => {
-                    if self.nodes[node].chance {
-                        return Err("an action observation reaches a chance node".into());
-                    }
-                    let mut matches = self.nodes[node]
-                        .acts
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, a)| obs_key(a) == key)
-                        .map(|(a, _)| self.nodes[node].child[self.nodes[node].obs_child[a]]);
-                    let first = matches.next().ok_or_else(|| format!("observation {key} is absent from the mandatory prefix"))?;
-                    if matches.any(|other| other != first) {
-                        return Err(format!("observation {key} has ambiguous public children"));
-                    }
-                    first
-                }
-            };
-            node = next;
+            if !self.nodes[node].chance || self.nodes[node].child.len() != 1 {
+                return Err("the retained chance transition is missing".into());
+            }
+            node = self.nodes[node].child[0];
             self.horizon = self.nodes[node].state.round + self.cfg.rounds as u16;
             if !self.nodes[node].state.is_terminal() {
                 self.nodes[node].expandable = true;
@@ -221,7 +176,7 @@ impl Solver {
             node.carry = false;
         }
         self.nodes[self.focus].carry = true;
-        if matches!(self.finish, Finish::Play(_)) {
+        if !matches!(self.finish, Finish::Target) {
             for child in self.nodes[self.focus].child.clone() {
                 self.nodes[child].carry = true;
             }
@@ -295,82 +250,69 @@ impl Solver {
         calls
     }
 
-    pub(super) fn read_back(&mut self, r: &Reply) -> Result<SolveOutput, String> {
+    pub(super) fn read_back(&mut self, r: &Reply) -> Result<Solved, String> {
         let focus = self.focus;
         let node = &self.nodes[focus];
-        let n = node.nc.map(|x| x as usize);
         let policy_at = 1 + self.carry_len();
         let expected = policy_at + node.legal_action.len();
         if r.a.len() != expected {
             return Err(format!("GPU read returned {} values, expected {expected}", r.a.len()));
         }
-        let value_at = 1 + n[0] + n[1];
-        let focus_reach = [&r.a[1..1 + n[0]], &r.a[1 + n[0]..value_at]];
-        let focus_value = [&r.a[value_at..value_at + n[0]], &r.a[value_at + n[0]..value_at + n[0] + n[1]]];
-        let focus_boundary = self.boundary(focus, focus_reach, focus_value)?;
-        let queries = std::mem::take(&mut self.queries);
-        match self.finish {
+        let mut at = 1;
+        let mut focus_values = None;
+        let mut children = Vec::new();
+        for i in (0..self.nodes.len()).filter(|&i| self.nodes[i].carry) {
+            let len = 2 * self.nodes[i].nc.iter().sum::<u32>() as usize;
+            let values = self.values_at(i, &r.a[at..at + len])?;
+            at += len;
+            if i == focus {
+                focus_values = values;
+                continue;
+            }
+            let ch = node.child.iter().position(|&c| c == i).ok_or("a carried node is not a focus child")?;
+            let key = obs_key(&node.acts[node.obs_act[node.obs_start[ch] as usize] as usize]);
+            children.extend(values.map(|values| (key, values)));
+        }
+        let action = match self.finish {
             Finish::Play(_) => {
                 let cell = r.a[0].to_bits() as usize;
-                if cell >= self.nodes[focus].legal_action.len() {
+                if cell >= node.legal_action.len() {
                     return Err("the GPU selected a cell outside the focus row".into());
                 }
-                let child = self.nodes[focus].legal_child[cell] as usize;
-                if child >= self.nodes.len() || !self.nodes[child].carry {
-                    return Err("the GPU selected an invalid continuation child".into());
-                }
-                let child_at = value_at + n[0] + n[1] + node.child.iter()
-                    .take_while(|&&c| c != child)
-                    .map(|&c| 2 * self.nodes[c].nc.iter().sum::<u32>() as usize)
-                    .sum::<usize>();
-                let cn = self.nodes[child].nc.map(|x| x as usize);
-                let child_value = child_at + cn[0] + cn[1];
-                let next_reach = [&r.a[child_at..child_at + cn[0]], &r.a[child_at + cn[0]..child_value]];
-                let next_value = [&r.a[child_value..child_value + cn[0]], &r.a[child_value + cn[0]..child_value + cn[0] + cn[1]]];
-                let action = self.nodes[focus].acts[self.nodes[focus].legal_action[cell] as usize];
-                let next = (!self.nodes[child].state.is_terminal())
-                    .then(|| self.boundary(child, next_reach, next_value))
-                    .transpose()?;
-                Ok(SolveOutput::Play(Box::new(PlaySolved {
-                    action,
-                    policy: self.policy_at(focus, &r.a[policy_at..]),
-                    focus: focus_boundary,
-                    next,
-                    queries,
-                })))
+                Some(node.acts[node.legal_action[cell] as usize])
             }
-            Finish::Refresh => Ok(SolveOutput::Refresh(Box::new(RefreshSolved { focus: focus_boundary, queries }))),
-            Finish::Target => {
-                let policy = self.policy_at(focus, &r.a[policy_at..]);
-                Ok(SolveOutput::Target(Box::new(TargetSolved {
-                    policy,
-                    values: focus_boundary.cfv,
-                    queries,
-                })))
-            }
-        }
+            _ => None,
+        };
+        let policy = self.policy_at(focus, &r.a[policy_at..]);
+        Ok(Solved {
+            action,
+            policy,
+            focus: focus_values.ok_or("the solve focus is unreached")?,
+            children,
+            queries: std::mem::take(&mut self.queries),
+        })
     }
 
-    fn boundary(&self, node: usize, reach: [&[f32]; 2], values: [&[f32]; 2]) -> Result<Boundary, String> {
-        let mut range = [Belief::default(), Belief::default()];
-        let mut cfv = [Vec::new(), Vec::new()];
+    fn values_at(&self, node: usize, carried: &[f32]) -> Result<Option<Values>, String> {
+        let n = &self.nodes[node];
+        if n.state.is_terminal() {
+            return Ok(None);
+        }
+        let [n0, n1] = n.nc.map(|x| x as usize);
+        let reach = [&carried[..n0], &carried[n0..n0 + n1]];
+        let vals = [&carried[n0 + n1..2 * n0 + n1], &carried[2 * n0 + n1..]];
+        if carried.iter().any(|x| !x.is_finite()) || reach.iter().any(|r| r.iter().any(|x| *x < 0.0)) {
+            return Err(format!("carry node {node} has invalid values"));
+        }
         let mass = [reach[0].iter().sum::<f32>(), reach[1].iter().sum::<f32>()];
-        if mass.iter().any(|x| !x.is_finite() || *x <= 0.0) {
-            return Err(format!("carry node {node} has invalid mass {mass:?}"));
+        if mass.iter().any(|m| *m <= 0.0) {
+            return Ok(None);
         }
-        for p in 0..2 {
-            if reach[p].iter().any(|x| !x.is_finite() || *x < 0.0)
-                || values[p].iter().any(|x| !x.is_finite())
-            {
-                return Err(format!("carry node {node} has invalid values"));
-            }
-            range[p] = Belief {
-                cfg: self.nodes[node].cfgs[p].to_vec(),
-                p: reach[p].iter().map(|x| x / mass[p]).collect(),
-            };
-            cfv[p] = values[p].iter().map(|x| x / mass[1 - p]).collect();
-        }
-        Boundary::new(self.nodes[node].state, range, cfv)
+        Ok(Some(Values {
+            state: n.state,
+            cfgs: [n.cfgs[0].to_vec(), n.cfgs[1].to_vec()],
+            cfv: std::array::from_fn(|p| vals[p].iter().map(|x| x / mass[1 - p]).collect()),
+        }))
     }
 
     fn policy_at(&self, node: usize, probs: &[f32]) -> Policy {
@@ -390,5 +332,4 @@ impl Solver {
         }
         out
     }
-
 }

@@ -3,7 +3,7 @@ use crate::board::NONE;
 use crate::contract::{Call, Dst, Prime, QueryPick, Reply, Writes};
 use crate::net::Net;
 use crate::pbs::*;
-use crate::resolve::{Boundary, PlaySolved, PublicState, PublicStep, RefreshSolved, ResolvePath, SolveOutput, TargetSolved};
+use crate::resolve::{PublicState, Solved};
 use crate::rng::Rng;
 use crate::state::{Cont, State};
 use crate::units::{ENSIGN, MARSHAL, ROYAL_COIN};
@@ -469,7 +469,7 @@ enum Phase {
 
 pub enum Step {
     Calls(Vec<Call>),
-    Done(Result<SolveOutput, String>),
+    Done(Result<Box<Solved>, String>),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -482,7 +482,6 @@ enum Finish {
 
 struct Gadget {
     resolver: u8,
-    previous: Vec<f32>,
     terminate: Vec<f32>,
 }
 
@@ -1282,7 +1281,7 @@ impl Solver {
                 self.absorb();
                 self.phase = Phase::Done;
                 let last = replies.last().expect("a round answers every call it was given");
-                return Step::Done(self.read_back(last));
+                return Step::Done(self.read_back(last).map(Box::new));
             }
             Phase::Done => unreachable!("a finished solve is not advanced again"),
         }
@@ -1335,7 +1334,7 @@ impl Solver {
                 calls.push(Call::Gadget {
                     solve: self.slot,
                     resolver: gadget.resolver,
-                    previous: gadget.previous.clone(),
+                    previous: self.root_belief[1 - gadget.resolver as usize].p.clone(),
                     terminate: gadget.terminate.clone(),
                 });
             }
