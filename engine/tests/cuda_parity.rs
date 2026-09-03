@@ -386,17 +386,11 @@ fn a_ragged_round_does_not_move_the_small_solve() {
         })
         .collect();
     let mut replies: Vec<Vec<Reply>> = big.iter().map(|_| Vec::new()).collect();
-    for _ in 0..12 {
+    while big.iter().any(|sv| sv.nodes.len() <= 20 * tiny) {
         if let Some((i, _)) = shared_round(&device, &mut big, &mut replies) {
             panic!("partner {i} finished before it had grown");
         }
     }
-    let grown: Vec<usize> = big.iter().map(|sv| sv.nodes.len()).collect();
-    eprintln!("small solve {tiny} nodes, partners {grown:?}");
-    assert!(
-        grown.iter().all(|&n| n > 20 * tiny),
-        "the partners did not grow, so the round is not ragged: {grown:?} against {tiny}"
-    );
 
     let (mut g, mut data, sv) = small();
     big.insert(0, sv);
