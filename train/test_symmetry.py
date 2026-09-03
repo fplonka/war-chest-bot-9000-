@@ -18,8 +18,7 @@ def main():
     policy = (desc, np.asarray([0, 1, 2]), np.asarray([0, 0, 1]),
               np.asarray([0, 1, 2]), np.asarray([0.2, 0.8, 1.0], np.float32),
               np.asarray([0, 0, 1]))
-    control = np.asarray([[0, 1, 2, 3] * 9 + [1]] * 2, np.int64)
-    parts = (rows, cc, player, weight, target, seg, policy, control)
+    parts = (rows, cc, player, weight, target, seg, policy)
     flipped = np.asarray([True, False])
 
     once = mirror.mirror_batch(parts, flipped)
@@ -36,9 +35,6 @@ def main():
         assert np.array_equal(got, want)
     for got, want in zip(twice[6], parts[6]):
         assert np.array_equal(got, want)
-    assert np.array_equal(once[7][1], control[1])
-    assert np.array_equal(once[7][0], mirror.FLIP[control[0][mirror.HEXMAP]])
-    assert np.array_equal(twice[7], control)
     print("replay symmetry OK")
 
 

@@ -70,8 +70,6 @@ def chunk(train, start, n):
     truth = np.zeros((n, 2), np.uint32)
     outcome = np.full((n, 2), np.nan, np.float32)
     outcome[ids % 5 == 0] = (0.25, -0.25)
-    control = ((ids[:, None] + np.arange(train.N_HEXES)) % 3).astype(np.uint8)
-    control[control == 2] = 255
     created = (1000.0 + ids).astype(np.float64)
     td1 = (ids % 7 == 0).astype(np.uint8)
 
@@ -96,7 +94,7 @@ def chunk(train, start, n):
     ])
     policy = (pa, paoff, pcoff, pci, pact, pprob)
     return (rows, cc, cw, cy, coff, boundaries, source, truth, outcome,
-            control, created, td1, policy)
+            created, td1, policy)
 
 
 def assert_same(left, right):

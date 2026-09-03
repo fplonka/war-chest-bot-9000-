@@ -83,7 +83,6 @@ class Net(nn.Module):
         self.join_out = nn.Linear(JW, D)
         self.ln_h = nn.LayerNorm(D)
         self.value_bias = nn.Parameter(torch.zeros(1))
-        self.control = nn.Linear(C, 3)
 
         nn.init.normal_(self.cfg_f.weight, std=1e-3)
         nn.init.zeros_(self.cfg_f.bias)
@@ -175,17 +174,13 @@ class Net(nn.Module):
         return self.join(p.repeat_interleave(2, 0), pair, seat)
 
 
-    def evaluate(self, xpub, phi, weight, seg, nseg):
-        cards = self.cards(xpub)
-        board, projected, spatial = self.position(xpub, self.tokens(xpub, cards))
-        own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
-        f, g, fp = self.configs(phi, own, seg)
-        h = self.heads(board, g, weight, seg, nseg)
-        value = (f * h[seg]).sum(1) + self.value_bias
-        return value, (cards, board, projected, spatial, fp, h)
-
     def forward(self, xpub, phi, weight, seg, nseg):
-        return self.evaluate(xpub, phi, weight, seg, nseg)[0]
+        cards = self.cards(xpub)
+        p = self.board(xpub, self.tokens(xpub, cards))
+        own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
+        f, g, _fp = self.configs(phi, own, seg)
+        h = self.heads(p, g, weight, seg, nseg)
+        return (f * h[seg]).sum(1) + self.value_bias
 
 
     def flat(self):
