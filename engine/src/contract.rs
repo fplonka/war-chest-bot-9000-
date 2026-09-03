@@ -41,6 +41,7 @@ pub enum Call {
         solve: usize,
         step: usize,
         iters: usize,
+        refresh: usize,
         expand: usize,
         query: Vec<QueryPick>,
         cfr: Cfr,

@@ -36,7 +36,7 @@ pub fn tree_source() -> String {
     out + "};\n"
 }
 
-const TABLE: [Col; 53] = [
+const TABLE: [Col; 54] = [
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Kind), name: "kind", ty: CU },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Player), name: "player", ty: CU },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Exhausted), name: "exhausted", ty: CU },
@@ -71,6 +71,7 @@ const TABLE: [Col; 53] = [
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelNode), name: "level_node", ty: CU },
     Col { ent: Ent::Reach, width: 1, dst: Some(Dst::Reach), name: "reach", ty: FM },
     Col { ent: Ent::Reach, width: 2, dst: None, name: "vals", ty: FM },
+    Col { ent: Ent::Reach, width: 2, dst: None, name: "opinion", ty: FM },
     Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Cur), name: "cur", ty: FM },
     Col { ent: Ent::Cell, width: 1, dst: None, name: "regret", ty: FM },
     Col { ent: Ent::Cell, width: 1, dst: None, name: "sum", ty: FM },
@@ -155,7 +156,7 @@ pub const Y_COFF: usize = lane(Ent::Row, "coff");
 const _: () = {
     assert!(FIELDS[0] == 18);
     assert!(FIELDS[1] == 13);
-    assert!(FIELDS[2] == 7);
+    assert!(FIELDS[2] == 9);
     assert!(FIELDS[3] == 4);
     assert!(FIELDS[4] == 5);
     assert!(FIELDS[5] == D + JW + NTYPE * C + N_HEXES * C);

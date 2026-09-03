@@ -1323,6 +1323,7 @@ impl Solver {
             solve: self.slot,
             step: self.steps[0],
             iters: done,
+            refresh: self.cfg.batch.max(1),
             expand,
             query,
             cfr: self.cfg.cfr,

@@ -74,6 +74,7 @@ kernels! {
     sum_slots,
     bag,
     leaf,
+    leaf_scale,
     reach_sweep,
     backprop_sweep,
 }
@@ -958,9 +959,9 @@ impl Card {
         drop(pack);
         self.priors(calls, &trees).map_err(at("priors"))?;
         let rule = |i| match &calls[i] {
-            Call::Iterate { cfr, puct, .. } => [
+            Call::Iterate { cfr, puct, refresh, .. } => [
                 cfr.alpha.to_bits(), cfr.beta.to_bits(), cfr.gamma.to_bits(),
-                cfr.predict.to_bits(), puct.to_bits(),
+                cfr.predict.to_bits(), puct.to_bits(), *refresh as u32,
             ],
             _ => unreachable!(),
         };
@@ -1674,7 +1675,7 @@ impl Card {
     fn value_pass(&self, b: &Batch) -> Res<()> {
         let all = b.all();
         self.reaches(b, all, 1, 0)?;
-        self.network(b, all)?;
+        self.network(b, all, true)?;
         self.terminals(b.trees.buf(), all)?;
         self.backprop(b, all, 1, 0, Cfr::LINEAR)
     }
@@ -1688,11 +1689,11 @@ impl Card {
         }
         let mut order: Vec<usize> = mine.to_vec();
         order.sort_by_key(|&i| std::cmp::Reverse(Self::asked(&calls[i]).0));
-        let (rounds, puct, k) = {
-            let Call::Iterate { iters, puct, cfr, .. } = &calls[order[0]] else {
+        let (rounds, refresh, puct, k) = {
+            let Call::Iterate { iters, refresh, puct, cfr, .. } = &calls[order[0]] else {
                 unreachable!("iterate shard holds only iterate calls")
             };
-            (*iters, *puct, *cfr)
+            (*iters, *refresh, *puct, *cfr)
         };
         let mut sims = 0usize;
         let mut query_at = vec![0usize; calls.len()];
@@ -1701,12 +1702,13 @@ impl Card {
         {
             let mut g = self.solves.lock();
             for &i in &order {
-                let Call::Iterate { solve, step, iters, expand, query, cfr, puct: p, .. } = &calls[i]
+                let Call::Iterate { solve, step, iters, expand, query, cfr, puct: p, refresh: r } =
+                    &calls[i]
                 else {
                     unreachable!("iterate shard holds only iterate calls")
                 };
-                assert_eq!((cfr.alpha, cfr.beta, cfr.gamma, cfr.predict, *p),
-                           (k.alpha, k.beta, k.gamma, k.predict, puct),
+                assert_eq!((cfr.alpha, cfr.beta, cfr.gamma, cfr.predict, *p, *r),
+                           (k.alpha, k.beta, k.gamma, k.predict, puct, refresh),
                            "a round mixes two regret rules");
                 let b = self.slot(&mut g, *solve);
                 b.step = *step;
@@ -1759,7 +1761,7 @@ impl Card {
                     }
                 }
             }
-            self.network(&b, p).map_err(at("net"))?;
+            self.network(&b, p, iter % refresh == 0).map_err(at("net"))?;
             self.terminals(b.trees.buf(), p).map_err(at("terminals"))?;
             self.backprop(&b, p, 0, it, k).map_err(at("backprop"))?;
             self.reaches(&b, p, 0, it).map_err(at("reach"))?;
@@ -1896,14 +1898,28 @@ impl Card {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn network(&self, b: &Batch, p: &Prefix) -> Res<()> {
-        let (trees, part_d, local_d, base_d, coff_d) =
-            (b.trees.buf(), b.part.buf(), b.local.buf(), b.base.buf(), b.coff.buf());
+    fn network(&self, b: &Batch, p: &Prefix, fresh: bool) -> Res<()> {
         let stride = p.rows;
         if stride == 0 {
             return Ok(());
         }
+        if fresh {
+            self.opinions(b, p)?;
+        }
+        let rows = (2 * stride) as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.leaf_scale)
+                .arg(b.trees.buf()).arg(b.part.buf()).arg(b.local.buf()).arg(&rows)
+                .launch_unit(warp_rows(2 * stride))
+        }
+        .map_err(err)
+    }
+
+    fn opinions(&self, b: &Batch, p: &Prefix) -> Res<()> {
+        let (trees, part_d, local_d, base_d, coff_d) =
+            (b.trees.buf(), b.part.buf(), b.local.buf(), b.base.buf(), b.coff.buf());
+        let stride = p.rows;
         let l = &self.layout;
         let tile = TILE.min(stride);
 

@@ -420,26 +420,17 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 
 
 #[test]
-fn cfr_average_uses_evaluated_strategies_and_global_steps() {
+fn a_one_update_average_is_the_initial_strategy() {
     let net = Arc::new(Net::random(0x9E37));
     let device = Backend(gpu(28));
-    let fresh = |s, batch| {
-        let cfg = Cfg { s, c: 0.0, batch, cfr: Cfr::DISCOUNTED, ..Default::default() };
-        let mut data = Data::default();
-        GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data)
-    };
-
-    let one = fresh(1, 1);
+    let cfg = Cfg { s: 1, c: 0.0, batch: 1, cfr: Cfr::DISCOUNTED, ..Default::default() };
+    let mut data = Data::default();
+    let one = GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data);
     let row = one.nodes[0].legal_row(0);
     let so = one.nodes[0].soff as usize;
     let initial = one.cur[so + row.start..so + row.end].to_vec();
     let solved = run_solve(&device, one).1.expect("one-update solve");
     assert!(worst(&initial, &solved.policy.p[..initial.len()], "one-update average") < 2e-6);
-
-    let solve = |batch| run_solve(&device, fresh(3, batch)).1.expect("three-update solve");
-    let together = solve(3);
-    let split = solve(1);
-    assert!(worst(&together.policy.p, &split.policy.p, "split average") < 2e-6);
 }
 
 #[test]

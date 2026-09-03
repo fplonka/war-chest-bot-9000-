@@ -699,10 +699,9 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
             const float* wj, const float* lnj, const float* owed,
             const float* cf_bias, const float* gamma, const float* beta,
             int rows, int q0) {
-    __shared__ __align__(16) float shared[J_ROWS * (J_D + 1)];
+    __shared__ __align__(16) float shared[J_ROWS * J_D];
     float* act = shared;
     float* pooled = shared + J_ROWS * J_LDS;
-    float* mass = shared + J_ROWS * J_D;
 
     int lane = threadIdx.x, slot = threadIdx.y;
     int tid = lane + 32 * slot, nt = 32 * J_SPAN;
@@ -722,7 +721,6 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
         float total = 0.0f;
         for (unsigned int c = lane; c < n; c += 32) total += t.reach[ra + c];
         total = warp_sum(total);
-        if (lane == 0) mass[qr] = total;
         float inv = total > SMOOTH ? 1.0f / total : 1.0f / (float)max(n, 1u);
         for (int j = lane; j < J_POOL; j += 32) {
             float acc = 0.0f;
@@ -842,8 +840,8 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
         unsigned int node = t.leaf_node[local_row[r]];
         unsigned int lo = coff[2 * r + traverser], hi = coff[2 * r + traverser + 1];
         unsigned int cs = t.coff[2 * local_row[r] + traverser];
-        float scale = mass[lr ^ 1], bias = *cf_bias;
-        float* vals = t.vals + traverser * t.nvals;
+        float bias = *cf_bias;
+        float* opinion = t.opinion + traverser * t.nvals;
         unsigned int vo = t.voff[node];
         for (unsigned int k = lo; k < hi; ++k) {
             const float* fr = t.f + (size_t)t.cidx[cs + k - lo] * J_D;
@@ -852,9 +850,26 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
             for (int q = 0; q < J_D / 32; ++q) acc += fr[lane + 32 * q] * h[q];
             for (int s = 16; s > 0; s >>= 1)
                 acc += __shfl_down_sync(0xffffffff, acc, s);
-            if (lane == 0) vals[vo + k - lo] = (acc + bias) * scale;
+            if (lane == 0) opinion[vo + k - lo] = acc + bias;
         }
     }
+}
+
+__global__ void k_leaf_scale(const Tree* trees, const int* part_of_row,
+                             const int* local_row, int rows) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= rows) return;
+    int traverser = row & 1, r = row >> 1, opp = 1 - traverser;
+    const Tree& t = trees[part_of_row[r]];
+    unsigned int node = t.leaf_node[local_row[r]];
+    unsigned int n = t.nc[2 * node + opp], ra = rbase(t, node, opp);
+    float mass = 0.0f;
+    for (unsigned int c = threadIdx.x; c < n; c += 32) mass += t.reach[ra + c];
+    mass = warp_sum(mass);
+    unsigned int m = t.nc[2 * node + traverser], vo = t.voff[node];
+    const float* opinion = t.opinion + traverser * t.nvals;
+    float* vals = t.vals + traverser * t.nvals;
+    for (unsigned int c = threadIdx.x; c < m; c += 32) vals[vo + c] = opinion[vo + c] * mass;
 }
 
 
