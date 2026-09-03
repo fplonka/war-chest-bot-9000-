@@ -300,7 +300,7 @@ def forward_values(net, parts):
 
 
 def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
-    v = net(xpub, phi, w, seg, nseg)
+    v, pieces = net.evaluate(xpub, phi, w, seg, nseg)
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
         expected.index_add_(0, seg, v.detach() * w)
@@ -319,22 +319,17 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     if stats is not None:
         stats["value_loss"] = float(loss.detach())
     if policy is not None and wp > 0.0:
-        pl = policy_loss(net, xpub, phi, w, seg, nseg, policy, stats)
+        pl = policy_loss(net, pieces, seg, policy, stats)
         if pl is not None:
             loss = loss + wp * pl
     return loss
 
 
-def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
+def policy_loss(net, pieces, seg, policy, stats=None):
     desc, parow, pact, _pcrow, pcfg, target = policy
     if desc.shape[0] == 0 or pact.shape[0] == 0:
         return None
-    cards = net.cards(xpub)
-    tokens = net.tokens(xpub, cards)
-    board, projected, spatial = net.position(xpub, tokens)
-    own = cards.reshape(-1, 2, NSLOT, cards.shape[-1]).flatten(0, 1)
-    _f, g, fp = net.configs(phi, own, seg)
-    h = net.heads(board, g, weight, seg, nseg)
+    cards, board, projected, spatial, fp, h = pieces
     action_query = torch.zeros(desc.shape[0], dtype=torch.long, device=desc.device)
     action_query.scatter_(0, pact, seg[pcfg])
     e = net.actions(desc, board, h, projected, spatial, parow, action_query)

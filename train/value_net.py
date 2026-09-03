@@ -174,13 +174,17 @@ class Net(nn.Module):
         return self.join(p.repeat_interleave(2, 0), pair, seat)
 
 
-    def forward(self, xpub, phi, weight, seg, nseg):
+    def evaluate(self, xpub, phi, weight, seg, nseg):
         cards = self.cards(xpub)
-        p = self.board(xpub, self.tokens(xpub, cards))
+        board, projected, spatial = self.position(xpub, self.tokens(xpub, cards))
         own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
-        f, g, _fp = self.configs(phi, own, seg)
-        h = self.heads(p, g, weight, seg, nseg)
-        return (f * h[seg]).sum(1) + self.value_bias
+        f, g, fp = self.configs(phi, own, seg)
+        h = self.heads(board, g, weight, seg, nseg)
+        value = (f * h[seg]).sum(1) + self.value_bias
+        return value, (cards, board, projected, spatial, fp, h)
+
+    def forward(self, xpub, phi, weight, seg, nseg):
+        return self.evaluate(xpub, phi, weight, seg, nseg)[0]
 
 
     def flat(self):
