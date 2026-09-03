@@ -1767,7 +1767,7 @@ impl Card {
             self.reaches(&b, p, 0, it).map_err(at("reach"))?;
             if sims > 0 {
                 {
-                    self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)
+                    self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds, p.items.len())
                 }
                 .map_err(at("expand"))?;
             }
@@ -1972,22 +1972,22 @@ impl Card {
     }
 
     fn expand(&self, trees: &CudaSlice<u64>, parts: u32, sims: usize, puct: f32,
-              iter: usize, iters: usize) -> Res<()> {
+              iter: usize, iters: usize, depth: usize) -> Res<()> {
         let each = parts as usize * sims;
+        let draws = sims * crate::search::TRIES;
         let mut sc = self.scratch.lock();
         let out = sc.leaves.room((iters * each).max(1))?;
-        let (parts_i, sims_i) = (parts as i32, sims as i32);
+        let (parts_i, sims_i, iter_i, each_i) = (parts as i32, sims as i32, iter as i32, each as i32);
+        let (tries_i, depth_i) = (crate::search::TRIES as i32, depth as i32);
         unsafe {
             self.stream
                 .launch_builder(&self.k.expand)
-                .arg(trees).arg(out).arg(&parts_i).arg(&sims_i).arg(&puct)
-                .arg(&(iter as i32))
-                .arg(&(each as i32))
-                .arg(&(crate::search::TRIES as i32))
+                .arg(trees).arg(out).arg(&parts_i).arg(&sims_i).arg(&puct).arg(&iter_i)
+                .arg(&each_i).arg(&tries_i).arg(&depth_i)
                 .launch_unit(LaunchConfig {
                     grid_dim: (parts.max(1), 1, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
+                    block_dim: (32, draws.clamp(1, 32) as u32, 1),
+                    shared_mem_bytes: (4 * draws * (depth + 2)) as u32,
                 })
         }
         .map_err(err)

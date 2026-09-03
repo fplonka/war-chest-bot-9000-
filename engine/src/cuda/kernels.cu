@@ -234,6 +234,22 @@ __device__ __forceinline__ void row_stats(const float* v, int c, float* mean,
     *inv = rsqrtf(t / c + 1e-5f);
 }
 
+__device__ __forceinline__ void pool_rows(const float* v, int nhex, int c, float* out) {
+    const int lane = threadIdx.x, slot = threadIdx.y;
+    for (int i = 0; i < 8; ++i) {
+        int j = 8 * slot + i;
+        float lo = lane < nhex ? v[lane * TRUNK_LDS + j] : 0.0f;
+        float hi = lane + 32 < nhex ? v[(lane + 32) * TRUNK_LDS + j] : 0.0f;
+        float sum = warp_sum(lo + hi);
+        float mx = fmaxf(lane < nhex ? lo : neg_inf(), lane + 32 < nhex ? hi : neg_inf());
+        for (int s = 16; s > 0; s >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, s));
+        if (lane == 0) {
+            out[j] = sum / nhex;
+            out[c + j] = mx;
+        }
+    }
+}
+
 __global__ __launch_bounds__(32 * TRUNK_SPAN, TRUNK_MIN_BLOCKS)
 void k_trunk(float* x0, const int* nb, const float* __restrict__ w,
              const float* __restrict__ wt, const float* __restrict__ bias,
@@ -284,25 +300,19 @@ void k_trunk(float* x0, const int* nb, const float* __restrict__ w,
             }
         }
         __syncthreads();
-        if (slot == 0) {
-            for (int q = 0; q < TRUNK_Q; ++q) {
-                int j = lane + 32 * q;
-                float sum = 0.0f, mx = neg_inf();
-                for (int h = 0; h < nhex; ++h) {
-                    float v = a[h * TRUNK_LDS + j];
-                    sum += v;
-                    mx = fmaxf(mx, v);
-                }
-                pooled[j] = sum / nhex;
-                pooled[c + j] = mx;
-            }
-            __syncwarp();
-            for (int q = 0; q < TRUNK_Q; ++q) {
-                int j = lane + 32 * q;
-                float sv = bias[o[3] + j];
-                for (int k = 0; k < 2 * c; ++k) sv += pooled[k] * w[o[2] + (size_t)k * c + j];
-                gb[j] = sv;
-            }
+        pool_rows(a, nhex, c, pooled);
+        __syncthreads();
+        for (int q = 0; q < TRUNK_Q; ++q) {
+            int j = lane + 32 * q;
+            float sv = 0.0f;
+            for (int k = 16 * slot; k < 16 * slot + 16; ++k) sv += pooled[k] * w[o[2] + (size_t)k * c + j];
+            u[slot * c + j] = sv;
+        }
+        __syncthreads();
+        for (int j = lane + 32 * slot; j < c; j += 32 * TRUNK_SPAN) {
+            float sv = bias[o[3] + j];
+            for (int s = 0; s < TRUNK_SPAN; ++s) sv += u[s * c + j];
+            gb[j] = sv;
         }
         float an[TRUNK_MT][4], as[TRUNK_MT][4];
 #pragma unroll
@@ -395,19 +405,7 @@ void k_trunk(float* x0, const int* nb, const float* __restrict__ w,
     }
     __syncthreads();
     int width = 2 * c + loose;
-    if (slot == 0) {
-        for (int q = 0; q < TRUNK_Q; ++q) {
-            int j = lane + 32 * q;
-            float sum = 0.0f, mx = neg_inf();
-            for (int h = 0; h < nhex; ++h) {
-                float v = x[h * TRUNK_LDS + j];
-                sum += v;
-                mx = fmaxf(mx, v);
-            }
-            out[(size_t)row * width + j] = sum / nhex;
-            out[(size_t)row * width + c + j] = mx;
-        }
-    }
+    pool_rows(x, nhex, c, out + (size_t)row * width);
     for (int k = lane + 32 * slot; k < loose; k += 32 * TRUNK_SPAN)
         out[(size_t)row * width + 2 * c + k] = xpub[(size_t)row * stride + off_loose + k];
 }
@@ -1079,75 +1077,101 @@ __global__ void k_prior(const Tree* trees, const unsigned int* part,
     for (unsigned int cell = a + lane; cell < b; cell += 32) t.prior[so + cell] *= scale;
 }
 
-__global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
-                         int sims, float c_puct, int iter, int each, int tries) {
+__device__ __forceinline__ unsigned long long rng_seed(unsigned long long seed,
+                                                       unsigned long long iter,
+                                                       unsigned long long draw) {
+    unsigned long long z = seed + iter * 0x9E3779B97F4A7C15ULL + (draw + 1) * 0xD1B54A32D192ED03ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    return z ? z : 1;
+}
+
+__global__ void k_expand(const Tree* trees, unsigned int* out, int parts, int sims,
+                         float c_puct, int iter, int each, int tries, int depth) {
+    extern __shared__ unsigned int path[];
     int part = blockIdx.x;
     if (part >= parts) return;
     const Tree& t = trees[part];
+    const int lane = threadIdx.x, warp = threadIdx.y, warps = blockDim.y;
+    const int draws = sims * tries;
+    unsigned int* cand = path + (size_t)draws * depth;
+    unsigned int* len = cand + draws;
     unsigned int* taken = out + (size_t)iter * each + (size_t)part * sims;
-    if (threadIdx.x == 0)
-        for (int sim = 0; sim < sims; ++sim) taken[sim] = NO_ROW;
-    __syncwarp();
-    if ((unsigned long long)iter >= t.todo || t.nexpand == 0) return;
-    unsigned long long s = *t.seed;
+    for (int i = lane + 32 * warp; i < sims; i += 32 * warps) taken[i] = NO_ROW;
+    if ((unsigned long long)iter >= t.todo) return;
+    int want = (int)t.nexpand;
     unsigned int n0 = t.nc[0], n1 = t.nc[1];
     const float* root = t.reach + t.roff[0];
-    float b0 = pick_sum(root, (int)n0), b1 = pick_sum(root + n0, (int)n1);
-    int want = (int)t.nexpand, got = 0;
-    for (int draw = 0; draw < want * tries && got < want; ++draw) {
-        int c[2];
-        c[0] = pick_from(root, (int)n0, b0, &s);
-        c[1] = pick_from(root + n0, (int)n1, b1, &s);
-        unsigned int node = 0;
+    for (int draw = warp; draw < draws; draw += warps) {
+        unsigned int* mine = path + (size_t)draw * depth;
         unsigned int found = NO_ROW;
-        for (;;) {
-            unsigned int k = t.kind[node];
-            if (k == KIND_LEAF) {
-                found = node;
-                break;
+        int steps = 0;
+        if (draw < want * tries) {
+            unsigned long long s = rng_seed(*t.seed, t.step + iter, draw);
+            int c[2];
+            c[0] = pick(root, (int)n0, &s);
+            c[1] = pick(root + n0, (int)n1, &s);
+            unsigned int node = 0;
+            for (;;) {
+                unsigned int k = t.kind[node];
+                if (k == KIND_LEAF) {
+                    found = node;
+                    break;
+                }
+                unsigned int me = t.player[node];
+                if (k == KIND_CHANCE) {
+                    unsigned int base = t.draw_base[node];
+                    unsigned int a = t.draw_start[base + c[me]];
+                    unsigned int b = t.draw_start[base + c[me] + 1];
+                    int j = pick(t.draw_p + a, (int)(b - a), &s);
+                    c[me] = (int)t.draw_to[a + j];
+                    node = t.child[t.child_at[node]];
+                    continue;
+                }
+                unsigned int lb = t.legal_base[node], so = t.soff[node];
+                unsigned int a = t.legal_off[lb + c[me]], b = t.legal_off[lb + c[me] + 1];
+                unsigned int cell;
+                if (rng_unit(&s) < 0.5) {
+                    cell = puct_choice(t, node, a, b, 1 - me, c_puct);
+                } else {
+                    bool any_sum = false;
+                    for (unsigned int q = a + lane; q < b; q += 32) any_sum |= t.sum[so + q] > 0.0f;
+                    any_sum = __any_sync(0xffffffff, any_sum);
+                    const float* row = any_sum ? t.sum + so + a : t.cur + so + a;
+                    cell = pick_live(t, so, a, b, row, &s);
+                }
+                if (cell == NO_ROW) break;
+                if (lane == 0) mine[steps] = so + cell;
+                ++steps;
+                c[me] = (int)t.legal_trans[so + cell];
+                node = t.legal_child[so + cell];
             }
-            unsigned int me = t.player[node];
-            if (k == KIND_CHANCE) {
-                unsigned int base = t.draw_base[node];
-                unsigned int a = t.draw_start[base + c[me]];
-                unsigned int b = t.draw_start[base + c[me] + 1];
-                int j = pick(t.draw_p + a, (int)(b - a), &s);
-                c[me] = (int)t.draw_to[a + j];
-                node = t.child[t.child_at[node]];
-                continue;
-            }
-            unsigned int lb = t.legal_base[node], so = t.soff[node];
-            unsigned int a = t.legal_off[lb + c[me]], b = t.legal_off[lb + c[me] + 1];
-            unsigned int cell;
-            if (rng_unit(&s) < 0.5) {
-                cell = puct_choice(t, node, a, b, 1 - me, c_puct);
-            } else {
-                bool mine = false;
-                for (unsigned int q = a + threadIdx.x; q < b; q += 32)
-                    mine |= t.sum[so + q] > 0.0f;
-                bool any = __any_sync(0xffffffff, mine);
-                const float* row = any ? t.sum + so + a : t.cur + so + a;
-                cell = pick_live(t, so, a, b, row, &s);
-            }
-            if (cell == NO_ROW) break;
-            if (threadIdx.x == 0) t.visits[so + cell] += 1.0f;
-            __syncwarp();
-            c[me] = (int)t.legal_trans[so + cell];
-            node = t.legal_child[so + cell];
         }
+        if (lane == 0) {
+            cand[draw] = found;
+            len[draw] = steps;
+        }
+    }
+    __syncthreads();
+    for (int draw = warp; draw < draws; draw += warps)
+        for (int d = lane; d < (int)len[draw]; d += 32)
+            atomicAdd(&t.visits[path[(size_t)draw * depth + d]], 1.0f);
+    if (warp != 0) return;
+    int got = 0;
+    for (int draw = 0; draw < draws && got < want; ++draw) {
+        unsigned int found = cand[draw];
         if (found == NO_ROW) continue;
         bool dup = false;
-        for (int k = threadIdx.x; k < (iter + 1) * sims; k += 32) {
+        for (int k = lane; k < (iter + 1) * sims; k += 32) {
             const unsigned int* r = out + (size_t)(k / sims) * each + (size_t)part * sims;
             dup |= r[k % sims] == found;
         }
-        if (!__any_sync(0xffffffff, dup)) {
-            if (threadIdx.x == 0) taken[got] = found;
-            __syncwarp();
-            ++got;
-        }
+        if (__any_sync(0xffffffff, dup)) continue;
+        if (lane == 0) taken[got] = found;
+        __syncwarp();
+        ++got;
     }
-    if (threadIdx.x == 0) *t.seed = s;
 }
 
 __global__ void k_terminals(const Tree* trees) {
