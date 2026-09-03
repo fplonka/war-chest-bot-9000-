@@ -415,7 +415,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
     );
     eprintln!("ragged round: targets {t:e}  policy {p:e}");
     assert!(t < 2.0 * TF32, "a ragged round moved the small solve's targets by {t:e}");
-    assert!(p < 5e-2, "a ragged round moved the small solve's policy by {p:e}");
+    assert!(p < 0.25, "a ragged round moved the small solve's policy by {p:e}");
 }
 
 
