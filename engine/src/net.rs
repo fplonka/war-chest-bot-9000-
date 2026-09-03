@@ -56,6 +56,7 @@ pub struct BlockSpan {
     pub mix: Span,
     pub pool: Span,
     pub out: Span,
+    pub dir: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +152,7 @@ impl NetLayout {
                 mix: c.lin(2 * C, C, true),
                 pool: c.lin(2 * C, C, true),
                 out: c.lin(C, C, true),
+                dir: c.embed(6 * C),
             }),
             board_out: c.lin(2 * C + LOOSE, D, true),
             cfg1: c.lin(3 + TYPE, CFGH, true),

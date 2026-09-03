@@ -858,7 +858,7 @@ impl Card {
             let (n0, n1) = (layout.norms[ln_block(i, 0)], layout.norms[ln_block(i, 1)]);
             plan.extend([blk.mix.w, blk.mix.b, blk.pool.w, blk.pool.b, blk.out.w,
                          blk.out.b, n0.g, n0.b, n1.g, n1.b].map(|x| x as i32));
-            plan.extend([lanes[2 * i], lanes[2 * i + 1]].map(|x| x as i32));
+            plan.extend([lanes[2 * i], lanes[2 * i + 1], blk.dir].map(|x| x as i32));
         }
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
