@@ -1271,33 +1271,39 @@ impl Solver {
             Phase::Reading => {
                 self.absorb();
                 self.phase = Phase::Done;
-                let last = replies.last().expect("a round answers every call it was given");
-                return Step::Done(self.read_back(last));
+                let [.., iterated, read] = replies else {
+                    unreachable!("the final round answers its regret updates and its read")
+                };
+                self.absorb_queries(&iterated.c);
+                return Step::Done(self.read_back(read));
             }
             Phase::Done => unreachable!("a finished solve is not advanced again"),
         }
+        let mut calls = self.iterate_round();
         if self.at < self.cfg.iters() {
             self.phase = Phase::Iterating;
-            Step::Calls(self.iterate_round())
         } else {
             self.phase = Phase::Reading;
-            Step::Calls(self.read_round())
+            calls.push(self.read_call());
         }
+        Step::Calls(calls)
     }
 
     fn round_shape(&self) -> (usize, usize) {
         let (iters, at) = (self.cfg.iters(), self.at);
         let want = self.expansions_at(at + 1);
-        let done = (at + 1..=iters)
+        let alike = (at + 1..=iters)
             .take_while(|&k| self.expansions_at(k) == want)
-            .count()
-            .min(self.cfg.batch.max(1));
-        (done, want)
+            .count();
+        let done = if want == 0 { alike } else { alike.min(self.cfg.batch.max(1)) };
+        let grown = if at + done < iters { want } else { 0 };
+        (done, grown)
     }
 
     fn iterate_round(&mut self) -> Vec<Call> {
         let (done, expand) = self.round_shape();
-        let mut calls = self.opening_calls();
+        let mut calls = self.growth_calls();
+        calls.push(self.tree_call());
         let query_rows = self.leaf_query_rows(0);
         let rows = query_rows.len();
         let selected = self.plan_query_events(done * rows);
@@ -1328,27 +1334,19 @@ impl Solver {
         calls
     }
 
-    fn opening_calls(&mut self) -> Vec<Call> {
-        let mut calls = self.growth_calls();
-        calls.push(self.tree_call());
-        calls
-    }
-
-    fn read_round(&mut self) -> Vec<Call> {
-        let mut calls = self.opening_calls();
+    fn read_call(&self) -> Call {
         let nvals = self.nvals as u32;
         let vals_at = match self.collect {
             None => [(0, 0); 2],
             Some(_) => [(self.nodes[0].voff, self.nodes[0].nc[0]), (nvals + self.nodes[0].voff, self.nodes[0].nc[1])],
         };
         let (at, cells) = self.root_cells();
-        calls.push(Call::Read {
+        Call::Read {
             solve: self.slot,
             touched: self.avg_touched,
             vals_at,
             policy_at: (at as u32, cells as u32),
-        });
-        calls
+        }
     }
 
     fn read_back(&mut self, r: &Reply) -> Option<Solved> {
