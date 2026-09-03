@@ -60,10 +60,11 @@ def main():
     source = np.where(query != 0, 2, 1).astype(np.uint8)
     truth = np.asarray(d["truth"], np.uint32).reshape(-1, 2)
     outcome = np.asarray(d["outcome"], np.float32).reshape(-1, 2)
+    control = np.asarray(d["control"], np.uint8).reshape(len(rows), -1)
     created = np.asarray(d["created"], np.float64)
     td1 = np.asarray(d["td1"], np.uint8)
     replay = (rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff,
-              soff, source, truth, outcome, created, td1)
+              soff, source, truth, outcome, control, created, td1)
     buf.add(*replay)
     tiny = Buffer(max(n * 2, 8), max(n * 2, 8) * 48)
     for _ in range(8):
@@ -77,11 +78,12 @@ def main():
 
     print("[3/5] solve-aligned split and batch assembly", flush=True)
     split = int(inner[-1])
-    block = lambda lo, hi: (*buf.gather(np.arange(lo, hi))[:6], empty_policy())
+    block = lambda lo, hi: (lambda g: (*g[:6], empty_policy(), g[7]))(buf.gather(np.arange(lo, hi)))
     tr, te = block(buf.lo, split), block(split, buf.rows)
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
-    xpub, phi, w, seg, y, nseg, policy = b
+    xpub, phi, w, seg, y, nseg, policy, control = b
+    assert control.shape == (len(tr[0]), warchest.N_HEXES), control.shape
     assert xpub.shape == (len(tr[0]), PUBFEAT), xpub.shape
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1

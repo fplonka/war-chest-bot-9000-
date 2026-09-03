@@ -6,6 +6,7 @@ N_HEXES = warchest.N_HEXES
 NSLOT = warchest.NSLOT
 NTYPE = warchest.NTYPE
 HEXMAP = np.asarray(warchest.hex_mirror(), np.int64)
+FLIP = np.asarray([1, 0, 2, 3], np.int64)
 
 
 def mirror_rows(rows):
@@ -14,7 +15,7 @@ def mirror_rows(rows):
 
 
 def mirror_batch(parts, flipped):
-    rows, cc, player, weight, target, seg, policy = parts
+    rows, cc, player, weight, target, seg, policy, control = parts
     flipped = np.asarray(flipped, dtype=bool)
     if flipped.shape != (len(rows),):
         raise ValueError("one symmetry choice is required per replay row")
@@ -23,6 +24,8 @@ def mirror_batch(parts, flipped):
 
     rows = rows.copy()
     rows[flipped] = mirror_rows(rows[flipped])
+    control = control.copy()
+    control[flipped] = FLIP[control[flipped][:, HEXMAP]]
     turned = flipped[seg // 2]
     player = player.copy()
     player[turned] ^= 1
@@ -41,4 +44,4 @@ def mirror_batch(parts, flipped):
         actions[here, field] = HEXMAP[actions[here, field]]
     desc[moved] = actions
     policy = (desc, pact, pcrow, pcfg, probability, parow)
-    return rows, cc, player, weight, target, seg, policy
+    return rows, cc, player, weight, target, seg, policy, control

@@ -1,5 +1,5 @@
 use crate::actions::{Action, N_PLAYS};
-use crate::board::NONE;
+use crate::board::{N_HEXES, NONE};
 use crate::net::Net;
 use crate::pbs::*;
 use crate::policy;
@@ -58,6 +58,7 @@ pub struct Data {
 
     pub truth: Vec<u32>,
     pub outcome: Vec<f32>,
+    pub control: Vec<u8>,
     pub created: Vec<f64>,
     solve_created: f64,
     pub query: Vec<u8>,
@@ -89,7 +90,7 @@ impl Data {
         macro_rules! append {
             ($($name:ident),* $(,)?) => { $( self.$name.extend(o.$name); )* };
         }
-        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query, td1);
+        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, control, created, query, td1);
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
@@ -163,6 +164,7 @@ impl Data {
         *self.pcoff.last_mut().expect("row offset") = self.pcell.len() as u32;
         self.truth.extend(truth);
         self.outcome.extend([f32::NAN; 2]);
+        self.control.extend([NONE; N_HEXES]);
         self.created.push(self.solve_created);
         self.query.push(0);
         self.td1.push(0);
@@ -388,6 +390,7 @@ impl Game {
             for (p, &outcome) in z.iter().enumerate() {
                 self.data.outcome[2 * r + p] = outcome;
             }
+            self.data.control[r * N_HEXES..(r + 1) * N_HEXES].copy_from_slice(&self.s.loc_marker);
             if self.gc.p_td1 <= 0.0 || self.rng.unit_f64() >= self.gc.p_td1 as f64 {
                 continue;
             }

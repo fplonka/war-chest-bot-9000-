@@ -81,6 +81,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         ("config offsets", d.coff.len(), if d.nv == 0 { 0 } else { 2 * d.nv + 1 }),
         ("truth", d.truth.len(), 2 * d.nv),
         ("outcomes", d.outcome.len(), 2 * d.nv),
+        ("control", d.control.len(), crate::board::N_HEXES * d.nv),
         ("creation times", d.created.len(), d.nv),
         ("query labels", d.query.len(), d.nv),
         ("TD(1) labels", d.td1.len(), d.nv),
@@ -103,7 +104,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     arrays! {
         rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, coff = d.coff,
         pa = d.pa, paoff = d.paoff, pcoff = d.pcoff, pci = d.pci,
-        pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome,
+        pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome, control = d.control,
         created = d.created, query = d.query, td1 = d.td1, soff = soff,
     }
     out.set_item("row_bytes", crate::pbs::ROW_BYTES)?;
