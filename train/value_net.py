@@ -24,6 +24,7 @@ C = 96
 BLOCKS = 8
 D = 256
 POOL = 64
+VH = 8
 CFGH = 128
 JW = 128
 JBLOCKS = 3
@@ -59,6 +60,9 @@ class Net(nn.Module):
         self.ln_trunk = nn.LayerNorm(C)
 
         self.board_out = nn.Linear(2 * C + LOOSE, D)
+        self.value_hex = nn.Linear(C, VH)
+        self.value_flat = nn.Linear(N_HEXES * VH, D, bias=False)
+        nn.init.zeros_(self.value_flat.weight)
 
         self.cfg1 = nn.Linear(3 + TYPE, CFGH)
         self.ln_cfg = nn.LayerNorm(CFGH)
@@ -125,7 +129,8 @@ class Net(nn.Module):
         projected = self.tok_stem(tokens)
         x = self.trunk(xpub, projected)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
-        board = self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
+        board = (self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
+                 + self.value_flat(gelu(self.value_hex(x)).flatten(1)))
         return board, projected, x
 
     def board(self, xpub, tokens):
@@ -194,7 +199,7 @@ class Net(nn.Module):
             self.card1, self.card2, self.pile, self.seat,
             self.hex_stem, self.tok_stem, self.pos, self.glob_stem,
             *blocks,
-            self.board_out,
+            self.board_out, self.value_hex, self.value_flat,
             self.cfg1, self.cfg_f, self.cfg_g, self.cfg_m,
             self.cfg_p, self.act_kind, self.act_role, self.act_board, self.act_out,
             self.join_p, self.join_b, *self.joinw, self.join_out,
