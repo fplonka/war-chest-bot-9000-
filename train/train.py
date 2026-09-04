@@ -57,6 +57,52 @@ def scheduled_lr(initial, final, elapsed, duration, stable_frac):
         math.pi * ((elapsed - stable) / (duration - stable)))) / 2.0
 
 
+def orthogonalize(g):
+    a, b, c = 3.4445, -4.775, 2.0315
+    x = g.bfloat16()
+    x = x / (x.norm() + 1e-7)
+    tall = x.shape[0] > x.shape[1]
+    if tall:
+        x = x.T
+    for _ in range(5):
+        xx = x @ x.T
+        x = a * x + (b * xx + c * xx @ xx) @ x
+    return (x.T if tall else x).to(g.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+
+    def __init__(self, net, lr):
+        matrix = {id(m.weight) for m in net.modules() if isinstance(m, nn.Linear)}
+        params = list(net.parameters())
+        super().__init__([
+            {"params": [p for p in params if id(p) not in matrix], "scale": 1.0},
+            {"params": [p for p in params if id(p) in matrix], "scale": 20.0},
+        ], {"lr": lr})
+
+    @torch.no_grad()
+    def step(self):
+        adam, muon = self.param_groups
+        for p in adam["params"]:
+            if p.grad is None:
+                continue
+            s = self.state[p]
+            s["t"] = s.get("t", 0) + 1
+            m = s.setdefault("m", torch.zeros_like(p))
+            v = s.setdefault("v", torch.zeros_like(p))
+            m.lerp_(p.grad, 0.1)
+            v.mul_(0.999).addcmul_(p.grad, p.grad, value=0.001)
+            step = m / (1.0 - 0.9 ** s["t"]) / ((v / (1.0 - 0.999 ** s["t"])).sqrt() + 1e-8)
+            p.add_(step, alpha=-adam["lr"])
+        for p in muon["params"]:
+            if p.grad is None:
+                continue
+            buf = self.state[p].setdefault("momentum", torch.zeros_like(p))
+            buf.lerp_(p.grad, 0.05)
+            update = orthogonalize(p.grad.lerp(buf, 0.95))
+            p.add_(update, alpha=-muon["lr"] * max(1.0, p.shape[0] / p.shape[1]) ** 0.5)
+
+
 class Buffer:
 
     def __init__(self, cap, ccap):
@@ -663,7 +709,7 @@ def main():
     y = torch.zeros(k, device=dev)
     parts = (x, phi, w, seg, y, 2 * n, None)
     scratch = Net().to(dev)
-    scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr, fused=True)
+    scratch_opt = Muon(scratch, args.lr)
     losses(scratch, *parts, wp=0.0)[0].backward()
     scratch_opt.step()
     forward_values(scratch, parts)
@@ -672,7 +718,7 @@ def main():
 
     torch.manual_seed(args.seed)
     value = Net().to(dev)
-    opt = torch.optim.Adam(value.parameters(), lr=args.lr, fused=True)
+    opt = Muon(value, args.lr)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
     if checkpoint:
         value.load_state_dict(checkpoint["value"])
@@ -773,9 +819,10 @@ def main():
 
     def fit(nsteps, deadline=None):
         if sog_t0 is not None:
-            opt.param_groups[0]["lr"] = scheduled_lr(
-                args.lr, args.lr_final, time.time() - sog_t0,
-                progress["lr_duration"], args.lr_stable_frac)
+            lr = scheduled_lr(args.lr, args.lr_final, time.time() - sog_t0,
+                              progress["lr_duration"], args.lr_stable_frac)
+            for group in opt.param_groups:
+                group["lr"] = lr * group["scale"]
         if nsteps < 1 or len(buf) < args.batch:
             return float("nan"), 0.0, {}
         tt = time.time()
