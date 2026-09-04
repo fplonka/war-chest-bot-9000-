@@ -10,6 +10,8 @@ for branch in "$@"; do
     git -C "$here" worktree add --force --detach "$tree" "$branch" &&
         "$tree/tools/box.sh" go --skip-ladder "out=smoke_$branch" \
             minutes=2 warm_minutes=1 snapshot_every=1 seed=1
-    echo "[$(date +%FT%T)] $branch exit $?"
+    status=$?
     git -C "$here" worktree remove --force "$tree"
+    [ "$status" -eq 0 ] || echo "SMOKE FAILED $branch exit $status"
 done
+echo "SMOKE DONE"
