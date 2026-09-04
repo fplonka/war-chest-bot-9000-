@@ -195,6 +195,7 @@ pub struct Game {
     gc: GameCfg,
     queries: Vec<(State, [Belief; 2])>,
     main_plays: u16,
+    last_value: [f32; 2],
 }
 
 fn draw_count(rng: &mut Rng, rate: f32) -> usize {
@@ -260,6 +261,7 @@ impl Game {
             gc: *gc,
             queries: Vec::new(),
             main_plays: 0,
+            last_value: [0.0; 2],
         }
     }
 
@@ -268,6 +270,10 @@ impl Game {
     }
 
     pub fn take_data(&mut self) -> Data {
+        assert!(
+            crate::finished(&self.s, self.main_plays),
+            "a game gives up its rows only once it has ended"
+        );
         std::mem::take(&mut self.data)
     }
 
@@ -289,7 +295,7 @@ impl Game {
 
     pub fn next_solve(&mut self, nets: &Arc<Net>) -> Option<Solver> {
         loop {
-            if self.s.is_terminal() || self.main_plays >= crate::PLAY_LIMIT {
+            if crate::finished(&self.s, self.main_plays) {
                 return None;
             }
             let player = self.s.to_act();
@@ -316,16 +322,7 @@ impl Game {
                     if self.gc.collect == Collect::Static && matches!(self.s.pending(), Cont::MainPlay) {
                         let y0 = vec![policy::eval_squashed(&self.s, 0); self.bel[0].cfg.len()];
                         let y1 = vec![policy::eval_squashed(&self.s, 1); self.bel[1].cfg.len()];
-                        let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
-                        self.data.begin_solve();
-                        self.data.push_value(
-                            &self.s,
-                            &self.ctx,
-                            &self.bel,
-                            [&y0, &y1],
-                            truth,
-                            &np.to_replay(player, &self.ctx),
-                        );
+                        self.record([&y0, &y1], &np.to_replay(player, &self.ctx));
                     }
                     self.play(np);
                 }
@@ -349,19 +346,17 @@ impl Game {
 
     pub fn play_solved(&mut self, sv: &Solver, solved: Option<Solved>) {
         if let Some(solved) = solved {
-            let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
-            self.data.begin_solve();
-            self.data.push_value(
-                &self.s,
-                &self.ctx,
-                &self.bel,
-                [&solved.value[0], &solved.value[1]],
-                truth,
-                &solved.policy,
-            );
+            self.record([&solved.value[0], &solved.value[1]], &solved.policy);
             self.queries.extend(solved.queries);
         }
         self.play(policy::root(sv));
+    }
+
+    fn record(&mut self, value: [&[f32]; 2], policy: &crate::search::Policy) {
+        let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
+        self.last_value = std::array::from_fn(|p| value[p][truth[p] as usize]);
+        self.data.begin_solve();
+        self.data.push_value(&self.s, &self.ctx, &self.bel, value, truth, policy);
     }
 
     fn true_index(&self, p: usize) -> usize {
@@ -384,24 +379,17 @@ impl Game {
         self.s.apply_inplace(np.acts[chosen]);
     }
 
-    fn continuation(&self) -> [f32; 2] {
-        let Some(r) = self.data.nv.checked_sub(1) else {
-            return [0.0; 2];
-        };
-        std::array::from_fn(|p| {
-            self.data.cy[self.data.row_span(r, p).start + self.data.truth[2 * r + p] as usize]
-        })
-    }
-
     pub fn finish(&mut self) -> f32 {
-        let z = if self.s.is_terminal() {
+        let ended = self.s.is_terminal();
+        let z = if ended {
             [self.s.utility(0), self.s.utility(1)]
         } else {
-            self.continuation()
+            self.last_value
         };
+        let outcome = if ended { z } else { [f32::NAN; 2] };
         for r in 0..self.data.nv {
-            for (p, &outcome) in z.iter().enumerate() {
-                self.data.outcome[2 * r + p] = outcome;
+            for p in 0..2 {
+                self.data.outcome[2 * r + p] = outcome[p];
             }
             if self.gc.p_td1 <= 0.0 || self.rng.unit_f64() >= self.gc.p_td1 as f64 {
                 continue;
@@ -415,7 +403,7 @@ impl Game {
         self.data.games += 1;
         match self.s.winner() {
             Some(w) => self.data.wins[w as usize] += 1,
-            None if self.s.is_terminal() => self.data.draws += 1,
+            None if ended => self.data.draws += 1,
             None => self.data.timeouts += 1,
         }
         z[WHITE as usize]

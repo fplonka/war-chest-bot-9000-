@@ -312,8 +312,7 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
     loss = (total / count.clamp(min=1)).mean()
     stats = {"value_loss": loss.detach(),
              "zero_sum_max": residual.abs().max(),
-             "zero_sum_square_sum": residual.square().sum(),
-             "zero_sum_n": len(residual)}
+             "zero_sum_square_sum": residual.square().sum()}
     if policy is not None and wp > 0.0:
         pl, policy_stats = policy_loss(net, pieces, seg, policy)
         if pl is not None:
@@ -351,8 +350,7 @@ def policy_loss(net, pieces, seg, policy):
     return loss, {"policy_loss_sum": loss.detach(),
                   "policy_target_entropy_sum": target_entropy.mean(),
                   "policy_prior_entropy_sum": prior_entropy.mean(),
-                  "policy_search_kl_sum": (search_ce - target_entropy).mean(),
-                  "policy_groups": groups, "policy_steps": 1}
+                  "policy_search_kl_sum": (search_ce - target_entropy).mean()}
 
 
 @torch.no_grad()
@@ -441,13 +439,16 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         loss, step_stat = losses(net, *parts, wp=policy_w)
+        stat["steps"] += 1
+        stat["zero_sum_n"] += parts[5] // 2
+        stat["policy_steps"] += "policy_loss_sum" in step_stat
         if stream is not None:
             f1.record(stream)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(net.parameters(), 5.0)
         step_stat.update(grad_norm_sum=grad_norm, grad_norm_max=grad_norm,
-                         grad_clipped=(grad_norm > 5.0).float(), steps=1)
+                         grad_clipped=(grad_norm > 5.0).float())
         accumulate(acc, step_stat)
         opt.step()
         if stream is not None:
@@ -455,9 +456,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             event_pairs.append((f0, f1, b1))
     if not acc:
         return float("nan"), stat
-    tensors = {key: value for key, value in acc.items() if torch.is_tensor(value)}
-    numbers = dict(zip(tensors, torch.stack([v.float() for v in tensors.values()]).tolist()))
-    stat.update({key: numbers.get(key, value) for key, value in acc.items()})
+    stat.update(dict(zip(acc, torch.stack([v.float() for v in acc.values()]).tolist())))
     if event_pairs:
         torch.cuda.synchronize(device)
         stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0

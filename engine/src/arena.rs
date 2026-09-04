@@ -180,10 +180,10 @@ impl Table {
                 });
                 b.pending[1 - player as usize].push(Obs::Draw { player, code: None });
             }
-            if b.s.is_terminal() || b.main_plays >= crate::PLAY_LIMIT {
+            if crate::finished(&b.s, b.main_plays) {
                 b.over = true;
-                let utility = b.s.is_terminal().then(|| b.s.utility(WHITE as usize));
-                ended.push((id, b.bots, utility.unwrap_or(0.0)));
+                let z = if b.s.is_terminal() { b.s.utility(WHITE as usize) } else { 0.0 };
+                ended.push((id, b.bots, z));
             } else if drew {
                 fresh.push((id, b.s, b.draft.clone()));
             }
@@ -222,7 +222,7 @@ impl Table {
         b.main_plays += matches!(b.s.pending(), Cont::MainPlay) as u16;
         b.s.apply_inplace(action);
         b.watched = [false, false];
-        let live = !b.s.is_terminal() && !b.s.is_chance() && b.main_plays < crate::PLAY_LIMIT;
+        let live = !crate::finished(&b.s, b.main_plays) && !b.s.is_chance();
         let reached = live.then_some((id, b.s, b.draft.clone()));
         b.pending[1 - player as usize].push(Obs::Act {
             player,
@@ -239,7 +239,7 @@ impl Table {
     pub fn request(&mut self, bot: usize) -> Request {
         let (mut go, mut watch) = (Vec::new(), Vec::new());
         for (&id, b) in self.bouts.iter_mut() {
-            if b.over || b.s.is_terminal() || b.s.is_chance() {
+            if crate::finished(&b.s, b.main_plays) || b.s.is_chance() {
                 continue;
             }
             let Some(seat) = b.bots.iter().position(|&x| x == bot) else {
