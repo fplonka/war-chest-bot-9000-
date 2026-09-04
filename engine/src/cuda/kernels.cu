@@ -174,7 +174,7 @@ __global__ void k_stem(float* x, const float* projected, const int* occupant,
 }
 
 
-#define TRUNK_OFF 13
+#define TRUNK_OFF 12
 #define TRUNK_MT (TRUNK_ROWS / 16)
 #define TRUNK_KS (TRUNK_C / 8)
 #define TRUNK_SPAN (TRUNK_C / 8)
@@ -349,7 +349,7 @@ void k_trunk(float* x0, const int* nb, const float* __restrict__ w,
                 if (live[t])
                     for (int k = 0; k < 6; ++k) {
                         int n = nb[hex[t] * 6 + k];
-                        if (n >= 0) v += w[o[12] + k * c + j] * u[n * TRUNK_LDS + j];
+                        if (n >= 0) v += u[n * TRUNK_LDS + j];
                     }
                 cur[q] = v;
             }
