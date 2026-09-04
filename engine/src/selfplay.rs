@@ -379,14 +379,14 @@ impl Game {
         self.s.apply_inplace(np.acts[chosen]);
     }
 
-    pub fn finish(&mut self) -> f32 {
+    pub fn finish(&mut self) {
         let ended = self.s.is_terminal();
-        let z = if ended {
-            [self.s.utility(0), self.s.utility(1)]
+        let (z, outcome) = if ended {
+            let z = [self.s.utility(0), self.s.utility(1)];
+            (z, z)
         } else {
-            self.last_value
+            (self.last_value, [f32::NAN; 2])
         };
-        let outcome = if ended { z } else { [f32::NAN; 2] };
         for r in 0..self.data.nv {
             for p in 0..2 {
                 self.data.outcome[2 * r + p] = outcome[p];
@@ -406,7 +406,6 @@ impl Game {
             None if ended => self.data.draws += 1,
             None => self.data.timeouts += 1,
         }
-        z[WHITE as usize]
     }
 }
 
@@ -514,12 +513,11 @@ impl GameStream {
 }
 
 #[cfg(feature = "python")]
-fn play_static_game(rng: Rng, net: &Arc<Net>, gc: &GameCfg, data: &mut Data) -> f32 {
+fn play_static_game(rng: Rng, net: &Arc<Net>, gc: &GameCfg, data: &mut Data) {
     let mut game = Game::new(rng, gc);
     assert!(game.next_solve(net).is_none(), "SoG self-play runs through SolveFarm");
-    let value = game.finish();
+    game.finish();
     data.merge(game.take_data());
-    value
 }
 pub(crate) fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) -> Action {
     debug_assert!(matches!(
