@@ -299,36 +299,33 @@ def forward_values(net, parts):
     return net(*parts[:4], parts[5])
 
 
-def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
+def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
     v, pieces = net.evaluate(xpub, phi, w, seg, nseg)
-    if stats is not None:
-        expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
-        expected.index_add_(0, seg, v.detach() * w)
-        residual = expected[0::2] + expected[1::2]
-        maximum, square_sum = torch.stack([
-            residual.abs().max(), residual.square().sum()]).cpu().tolist()
-        stats["zero_sum_max"] = max(stats["zero_sum_max"], maximum)
-        stats["zero_sum_square_sum"] += square_sum
-        stats["zero_sum_n"] += len(residual)
+    expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
+    expected.index_add_(0, seg, v.detach() * w)
+    residual = expected[0::2] + expected[1::2]
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
     total = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     total.index_add_(0, seg, per)
     count.index_add_(0, seg, torch.ones_like(per))
     loss = (total / count.clamp(min=1)).mean()
-    if stats is not None:
-        stats["value_loss"] = float(loss.detach())
+    stats = {"value_loss": loss.detach(),
+             "zero_sum_max": residual.abs().max(),
+             "zero_sum_square_sum": residual.square().sum(),
+             "zero_sum_n": len(residual)}
     if policy is not None and wp > 0.0:
-        pl = policy_loss(net, pieces, seg, policy, stats)
+        pl, policy_stats = policy_loss(net, pieces, seg, policy)
         if pl is not None:
             loss = loss + wp * pl
-    return loss
+            stats.update(policy_stats)
+    return loss, stats
 
 
-def policy_loss(net, pieces, seg, policy, stats=None):
-    desc, parow, pact, _pcrow, pcfg, target = policy
+def policy_loss(net, pieces, seg, policy):
+    desc, parow, pact, _pcrow, pcfg, target, inv, groups = policy
     if desc.shape[0] == 0 or pact.shape[0] == 0:
-        return None
+        return None, {}
     cards, board, projected, spatial, fp, h = pieces
     action_query = torch.zeros(desc.shape[0], dtype=torch.long, device=desc.device)
     action_query.scatter_(0, pact, seg[pcfg])
@@ -336,35 +333,26 @@ def policy_loss(net, pieces, seg, policy, stats=None):
 
     logit = (fp[pcfg] * e[pact]).sum(1)
 
-    group = pcfg
-    uniq, inv = torch.unique(group, return_inverse=True)
-    top = torch.full((len(uniq),), -1e30, device=logit.device)
+    top = torch.full((groups,), -1e30, device=logit.device)
     top = top.scatter_reduce(0, inv, logit, reduce="amax")
     ex = (logit - top[inv]).exp()
-    tot = torch.zeros(len(uniq), device=ex.device).index_add_(0, inv, ex)
+    tot = torch.zeros(groups, device=ex.device).index_add_(0, inv, ex)
     logp = (logit - top[inv]) - tot[inv].clamp(min=1e-30).log()
     per = -(target * logp)
-    out = torch.zeros(len(uniq), device=per.device).index_add_(0, inv, per)
+    out = torch.zeros(groups, device=per.device).index_add_(0, inv, per)
     loss = out.mean()
-    if stats is not None:
-        target_mass = torch.zeros(len(uniq), device=target.device).index_add_(
-            0, inv, target)
-        q = target / target_mass[inv].clamp(min=1e-30)
-        target_entropy = torch.zeros(len(uniq), device=target.device).index_add_(
-            0, inv, -(q * q.clamp(min=1e-30).log()))
-        prior = logp.exp()
-        prior_entropy = torch.zeros(len(uniq), device=target.device).index_add_(
-            0, inv, -(prior * logp))
-        search_ce = torch.zeros(len(uniq), device=target.device).index_add_(
-            0, inv, -(q * logp))
-        values = torch.stack([
-            loss, target_entropy.mean(), prior_entropy.mean(),
-            (search_ce - target_entropy).mean()]).detach().cpu().tolist()
-        stats.update(dict(zip((
-            "policy_loss", "policy_target_entropy", "policy_prior_entropy",
-            "policy_search_kl"), values)))
-        stats["policy_groups"] = len(uniq)
-    return loss
+    target_mass = torch.zeros(groups, device=target.device).index_add_(0, inv, target)
+    q = target / target_mass[inv].clamp(min=1e-30)
+    target_entropy = torch.zeros(groups, device=target.device).index_add_(
+        0, inv, -(q * q.clamp(min=1e-30).log()))
+    prior_entropy = torch.zeros(groups, device=target.device).index_add_(
+        0, inv, -(logp.exp() * logp))
+    search_ce = torch.zeros(groups, device=target.device).index_add_(0, inv, -(q * logp))
+    return loss, {"policy_loss_sum": loss.detach(),
+                  "policy_target_entropy_sum": target_entropy.mean(),
+                  "policy_prior_entropy_sum": prior_entropy.mean(),
+                  "policy_search_kl_sum": (search_ce - target_entropy).mean(),
+                  "policy_groups": groups, "policy_steps": 1}
 
 
 @torch.no_grad()
@@ -385,8 +373,8 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
     old = batch_fn(buf.sample_old(batch, rng, recent_frac), rng, device)
     new = batch_fn(buf.sample(batch, rng, recent_mix=1.0, recent_frac=recent_frac),
                    rng, device)
-    out["loss_old"] = float(losses(net, *old, wp=0.0))
-    out["loss_new"] = float(losses(net, *new, wp=0.0))
+    out["loss_old"] = float(losses(net, *old, wp=0.0)[0])
+    out["loss_new"] = float(losses(net, *new, wp=0.0)[0])
     calibration = buf.sample_calibration(batch, rng)
     if calibration is None:
         return out
@@ -407,6 +395,14 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
     return out
 
 
+def accumulate(acc, stats):
+    for key, value in stats.items():
+        if key.endswith("_max") and key in acc:
+            acc[key] = torch.maximum(acc[key], value)
+        else:
+            acc[key] = acc.get(key, 0) + value
+
+
 def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
                 batch_fn=None, policy_w=0.0, deadline=None):
@@ -415,7 +411,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     stat["sample_delays"] = []
     if len(buf) < batch:
         return float("nan"), stat
-    tot = 0.0
+    acc = {}
     event_pairs = []
     stream = torch.cuda.current_stream(device) if profile_cuda and device.type == "cuda" else None
     for _ in range(steps):
@@ -444,35 +440,29 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             f1 = torch.cuda.Event(enable_timing=True)
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
-        step_stat = {"zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
-                     "zero_sum_n": 0}
-        value = losses(net, *parts, wp=policy_w, stats=step_stat)
-        tot += step_stat["value_loss"]
-        stat["zero_sum_max"] = max(stat["zero_sum_max"], step_stat["zero_sum_max"])
-        stat["zero_sum_square_sum"] += step_stat["zero_sum_square_sum"]
-        stat["zero_sum_n"] += step_stat["zero_sum_n"]
-        if "policy_loss" in step_stat:
-            stat["policy_steps"] += 1
-            for key in POLICY_METRICS:
-                stat[f"{key}_sum"] += step_stat[key]
+        loss, step_stat = losses(net, *parts, wp=policy_w)
         if stream is not None:
             f1.record(stream)
         opt.zero_grad(set_to_none=True)
-        value.backward()
-        grad_norm = float(nn.utils.clip_grad_norm_(net.parameters(), 5.0))
-        stat["grad_norm_sum"] += grad_norm
-        stat["grad_norm_max"] = max(stat["grad_norm_max"], grad_norm)
-        stat["grad_clipped"] += int(grad_norm > 5.0)
+        loss.backward()
+        grad_norm = nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+        step_stat.update(grad_norm_sum=grad_norm, grad_norm_max=grad_norm,
+                         grad_clipped=(grad_norm > 5.0).float(), steps=1)
+        accumulate(acc, step_stat)
         opt.step()
-        stat["steps"] += 1
         if stream is not None:
             b1.record(stream)
             event_pairs.append((f0, f1, b1))
+    if not acc:
+        return float("nan"), stat
+    tensors = {key: value for key, value in acc.items() if torch.is_tensor(value)}
+    numbers = dict(zip(tensors, torch.stack([v.float() for v in tensors.values()]).tolist()))
+    stat.update({key: numbers.get(key, value) for key, value in acc.items()})
     if event_pairs:
         torch.cuda.synchronize(device)
         stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0
         stat["gpu_backward_s"] = sum(b.elapsed_time(c) for _, b, c in event_pairs) / 1000.0
-    return tot / stat["steps"] if stat["steps"] else float("nan"), stat
+    return stat.pop("value_loss") / stat["steps"], stat
 
 
 def ingest(buf, data, warm=False):
@@ -674,8 +664,8 @@ def main():
     y = torch.zeros(k, device=dev)
     parts = (x, phi, w, seg, y, 2 * n, None)
     scratch = Net().to(dev)
-    scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr)
-    losses(scratch, *parts, wp=0.0).backward()
+    scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr, fused=True)
+    losses(scratch, *parts, wp=0.0)[0].backward()
     scratch_opt.step()
     forward_values(scratch, parts)
     torch.cuda.synchronize(dev)
@@ -683,7 +673,7 @@ def main():
 
     torch.manual_seed(args.seed)
     value = Net().to(dev)
-    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(value.parameters(), lr=args.lr, fused=True)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
     if checkpoint:
         value.load_state_dict(checkpoint["value"])

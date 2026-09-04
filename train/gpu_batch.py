@@ -24,7 +24,8 @@ def make_batch(parts, rng, device):
     n = len(rows)
     rows = np.ascontiguousarray(rows)
     cc = np.ascontiguousarray(cc)
-    t = lambda a, dtype=None: torch.as_tensor(a, dtype=dtype, device=device)
+    t = lambda a, dtype=None: torch.as_tensor(a, dtype=dtype).pin_memory().to(
+        device, non_blocking=True)
     rows_t = t(rows, torch.uint8)
     cards, locations = _tables(str(device))
     x = torch.empty((n, warchest.PUBFEAT), dtype=torch.float32, device=device)
@@ -36,9 +37,10 @@ def make_batch(parts, rng, device):
 
     phi = t(cc, torch.float32) / float(warchest.CNORM)
     pa, pact, pcrow, pcfg, pprob, parow = pol
+    groups, inv = np.unique(pcfg, return_inverse=True)
     policy = (t(pa, torch.uint8), t(parow, torch.long),
               t(pact, torch.long), t(pcrow, torch.long), t(pcfg, torch.long),
-              t(pprob, torch.float32))
+              t(pprob, torch.float32), t(inv, torch.long), len(groups))
     return (x, phi, t(cw, torch.float32), t(seg, torch.long),
             t(cy, torch.float32), 2 * n, policy)
 
