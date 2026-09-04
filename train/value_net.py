@@ -24,6 +24,7 @@ C = 96
 BLOCKS = 8
 D = 256
 POOL = 64
+VH = 8
 CFGH = 128
 JW = 128
 JBLOCKS = 3
@@ -35,6 +36,25 @@ JOIN_IN = 2 * POOL + 1
 
 def gelu(x):
     return F.gelu(x, approximate="tanh")
+
+
+class HexPairs(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        rotated = np.asarray(warchest.hex_mirror())
+        pairs, pair_of = np.unique(np.minimum(np.arange(N_HEXES), rotated),
+                                   return_inverse=True)
+        self.register_buffer("pair_of", torch.as_tensor(pair_of), persistent=False)
+        self.pairs = nn.Parameter(torch.zeros(D, len(pairs), VH))
+        self.bias = None
+
+    @property
+    def weight(self):
+        return self.pairs[:, self.pair_of].flatten(1)
+
+    def forward(self, x):
+        return F.linear(x, self.weight)
 
 
 class Net(nn.Module):
@@ -59,6 +79,8 @@ class Net(nn.Module):
         self.ln_trunk = nn.LayerNorm(C)
 
         self.board_out = nn.Linear(2 * C + LOOSE, D)
+        self.value_hex = nn.Linear(C, VH)
+        self.value_flat = HexPairs()
 
         self.cfg1 = nn.Linear(3 + TYPE, CFGH)
         self.ln_cfg = nn.LayerNorm(CFGH)
@@ -125,7 +147,8 @@ class Net(nn.Module):
         projected = self.tok_stem(tokens)
         x = self.trunk(xpub, projected)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
-        board = self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
+        board = (self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
+                 + self.value_flat(gelu(self.value_hex(x)).flatten(1)))
         return board, projected, x
 
     def board(self, xpub, tokens):
@@ -194,7 +217,7 @@ class Net(nn.Module):
             self.card1, self.card2, self.pile, self.seat,
             self.hex_stem, self.tok_stem, self.pos, self.glob_stem,
             *blocks,
-            self.board_out,
+            self.board_out, self.value_hex, self.value_flat,
             self.cfg1, self.cfg_f, self.cfg_g, self.cfg_m,
             self.cfg_p, self.act_kind, self.act_role, self.act_board, self.act_out,
             self.join_p, self.join_b, *self.joinw, self.join_out,
