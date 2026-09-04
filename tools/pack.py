@@ -46,7 +46,7 @@ def pack(run):
         checkpoint = torch.load(run / snap["file"], map_location="cpu",
                                 weights_only=False)
         net = Net()
-        net.load_state_dict(checkpoint["value"])
+        net.load_state_dict(checkpoint["acting"])
         search = {"s": cfg.get("s", 512),
                   "c": cfg.get("c", 8.0),
                   "batch": cfg.get("round_batch", 8),

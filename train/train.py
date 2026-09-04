@@ -1,6 +1,7 @@
 
 import argparse
 import collections
+import copy
 import dataclasses
 import json
 import math
@@ -33,6 +34,7 @@ ACT_BYTES = warchest.ACT_BYTES
 NSLOT = warchest.NSLOT
 
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
+EMA = 0.999
 POLICY_METRICS = ("policy_loss", "policy_target_entropy", "policy_prior_entropy",
                   "policy_search_kl")
 
@@ -401,7 +403,7 @@ def accumulate(acc, stats):
             acc[key] = acc.get(key, 0) + value
 
 
-def train_steps(net, opt, buf, steps, batch, rng, device,
+def train_steps(net, acting, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
                 batch_fn=None, policy_w=0.0, deadline=None):
     stat = collections.Counter()
@@ -451,6 +453,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
                          grad_clipped=(grad_norm > 5.0).float())
         accumulate(acc, step_stat)
         opt.step()
+        torch._foreach_lerp_(list(acting.parameters()), list(net.parameters()), 1.0 - EMA)
         if stream is not None:
             b1.record(stream)
             event_pairs.append((f0, f1, b1))
@@ -672,10 +675,12 @@ def main():
 
     torch.manual_seed(args.seed)
     value = Net().to(dev)
+    acting = copy.deepcopy(value).requires_grad_(False)
     opt = torch.optim.Adam(value.parameters(), lr=args.lr, fused=True)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
     if checkpoint:
         value.load_state_dict(checkpoint["value"])
+        acting.load_state_dict(checkpoint["acting"])
         opt.load_state_dict(checkpoint["optimizer"])
         target_state = checkpoint["target"]
         publish_state(target_state)
@@ -686,9 +691,10 @@ def main():
         buf.load_state_dict(checkpoint["buffer"])
     else:
         if args.init_weights:
-            value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
-        value.push()
-        target_state = cpu_state(value)
+            for net in (value, acting):
+                net.load_state_dict(load_checkpoint(args.init_weights).state_dict())
+        acting.push()
+        target_state = cpu_state(acting)
     peak = torch.cuda.max_memory_reserved(dev)
     print(f"[train] torch peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
           f"(rows={n} configs={k}); farm carves mem_get_info free",
@@ -732,6 +738,7 @@ def main():
         cfg["resume"] = ""
         state = {
             "value": value.state_dict(),
+            "acting": acting.state_dict(),
             "optimizer": opt.state_dict(),
             "target": target_state,
             "numpy_rng": rng.bit_generator.state,
@@ -780,7 +787,7 @@ def main():
             return float("nan"), 0.0, {}
         tt = time.time()
         lv, st = train_steps(
-            value, opt, buf, nsteps, args.batch, rng, dev,
+            value, acting, opt, buf, nsteps, args.batch, rng, dev,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
             batch_fn=batcher, policy_w=args.policy_w, deadline=deadline)
@@ -884,8 +891,8 @@ def main():
                 save_progress()
                 break
             if now >= next_target:
-                value.push()
-                target_state = cpu_state(value)
+                acting.push()
+                target_state = cpu_state(acting)
                 if len(buf) >= 2048:
                     probe = batcher(buf.sample(2048, diag_rng), diag_rng, dev)
                 print(
@@ -1146,8 +1153,8 @@ def main():
                 f"rows={n:6d} L={lv if steps else float('nan'):.5f} "
                 f"tgt={rec['tgt_mean']:+.3f}/{rec['tgt_std']:.3f} "
                 f"gen={gen_s:.1f}s train={train_s:.1f}s")
-        value.push()
-        target_state = cpu_state(value)
+        acting.push()
+        target_state = cpu_state(acting)
         sog_t0 = time.time()
         progress["sog_start"] = sog_t0 - t0
         progress["next_target"] = (sog_t0 - t0) + args.target_every * 60.0
@@ -1155,7 +1162,7 @@ def main():
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
-    del value, opt, probe, buf
+    del value, acting, opt, probe, buf
     torch.cuda.empty_cache()
     subprocess.run([sys.executable, str(ROOT / "tools" / "pack.py"),
                     args.out], check=True)
