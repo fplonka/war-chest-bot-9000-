@@ -31,7 +31,7 @@ class Cfg:
     query_rate: float = 0.9
     recursive_rate: float = 0.1
     cfr: str = "sog"
-    policy_w: float = 0.01
+    policy_w: float = 0.05
     explore: float = 0.1
     temp: float = 2.0
     warm_games: int = 96
