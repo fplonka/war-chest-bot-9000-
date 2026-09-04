@@ -191,7 +191,9 @@ pub struct Game {
     s: State,
     ctx: Ctx,
     bel: [Belief; 2],
-    data: Data,
+    label: Rng,
+    ready: Data,
+    pending: Data,
     gc: GameCfg,
     queries: Vec<(State, [Belief; 2])>,
     main_plays: u16,
@@ -250,6 +252,7 @@ fn collects_rows(gc: &GameCfg, s: &State) -> bool {
 
 impl Game {
     pub fn new(mut rng: Rng, gc: &GameCfg) -> Game {
+        let label = Rng::new(rng.next_u64());
         let s = make_game(&mut rng, gc.random_draft);
         let ctx = Ctx::new(&s);
         Game {
@@ -257,7 +260,9 @@ impl Game {
             s,
             ctx,
             bel: [Belief::point(Config::default()), Belief::point(Config::default())],
-            data: Data::default(),
+            label,
+            ready: Data::default(),
+            pending: Data::default(),
             gc: *gc,
             queries: Vec::new(),
             main_plays: 0,
@@ -269,24 +274,8 @@ impl Game {
         std::mem::take(&mut self.queries)
     }
 
-    pub fn take_data(&mut self) -> Data {
-        assert!(
-            crate::finished(&self.s, self.main_plays),
-            "a game gives up its rows only once it has ended"
-        );
-        std::mem::take(&mut self.data)
-    }
-
     pub fn take_ready(&mut self) -> Data {
-        if self.gc.p_td1 <= 0.0 {
-            return std::mem::take(&mut self.data);
-        }
-        Data {
-            decisions: std::mem::take(&mut self.data.decisions),
-            configs: std::mem::take(&mut self.data.configs),
-            plays: std::mem::take(&mut self.data.plays),
-            ..Default::default()
-        }
+        std::mem::take(&mut self.ready)
     }
 
     pub fn next_solve(&mut self, nets: &Arc<Net>) -> Option<Solver> {
@@ -304,8 +293,8 @@ impl Game {
                 resolve_chance(&mut self.s, player, &mut self.rng);
                 continue;
             }
-            self.data.decisions += 1;
-            self.data.configs += self.bel[player as usize].cfg.len();
+            self.ready.decisions += 1;
+            self.ready.configs += self.bel[player as usize].cfg.len();
             self.main_plays += matches!(self.s.pending(), Cont::MainPlay) as u16;
             match self.gc.agents[player as usize] {
                 Agent::Random => {
@@ -352,8 +341,13 @@ impl Game {
     fn record(&mut self, value: [&[f32]; 2], policy: &crate::search::Policy) {
         let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
         self.last_value = std::array::from_fn(|p| value[p][truth[p] as usize]);
-        self.data.begin_solve();
-        self.data.push_value(&self.s, &self.ctx, &self.bel, value, truth, policy);
+        let outcome_needed = self.label.unit_f64() < self.gc.p_td1 as f64;
+        let data = if outcome_needed { &mut self.pending } else { &mut self.ready };
+        data.begin_solve();
+        data.push_value(&self.s, &self.ctx, &self.bel, value, truth, policy);
+        if outcome_needed {
+            *data.td1.last_mut().expect("the row just pushed") = 1;
+        }
     }
 
     fn true_index(&self, p: usize) -> usize {
@@ -372,7 +366,7 @@ impl Game {
         let chosen_cell = np.sample(&mut self.rng, true_ci);
         let chosen = np.action_at(chosen_cell);
         self.bel[me] = np.posterior(&self.bel[me], obs_key(&np.acts[chosen]));
-        if let Some(slot) = self.data.plays.get_mut(np.acts[chosen].play() as usize) {
+        if let Some(slot) = self.ready.plays.get_mut(np.acts[chosen].play() as usize) {
             *slot += 1;
         }
         self.s.apply_inplace(np.acts[chosen]);
@@ -386,24 +380,20 @@ impl Game {
         } else {
             (self.last_value, [f32::NAN; 2])
         };
-        for r in 0..self.data.nv {
+        for r in 0..self.pending.nv {
             for p in 0..2 {
-                self.data.outcome[2 * r + p] = outcome[p];
-            }
-            if self.gc.p_td1 <= 0.0 || self.rng.unit_f64() >= self.gc.p_td1 as f64 {
-                continue;
-            }
-            self.data.td1[r] = 1;
-            for p in 0..2 {
-                let at = self.data.row_span(r, p).start + self.data.truth[2 * r + p] as usize;
-                self.data.cy[at] = z[p];
+                self.pending.outcome[2 * r + p] = outcome[p];
+                let at = self.pending.row_span(r, p).start + self.pending.truth[2 * r + p] as usize;
+                self.pending.cy[at] = z[p];
             }
         }
-        self.data.games += 1;
+        let pending = std::mem::take(&mut self.pending);
+        self.ready.merge(pending);
+        self.ready.games += 1;
         match self.s.winner() {
-            Some(w) => self.data.wins[w as usize] += 1,
-            None if ended => self.data.draws += 1,
-            None => self.data.timeouts += 1,
+            Some(w) => self.ready.wins[w as usize] += 1,
+            None if ended => self.ready.draws += 1,
+            None => self.ready.timeouts += 1,
         }
     }
 }
@@ -498,7 +488,7 @@ impl GameStream {
         self.game.finish();
         let queued = self.game.take_queries();
         out.dropped += self.enqueue(queued);
-        out.merge(self.game.take_data());
+        out.merge(self.game.take_ready());
         self.game = Game::new(Rng::new(worker_seed(self.seed, self.game_index)), &self.gc);
         self.game_index += 1;
     }
@@ -516,7 +506,7 @@ fn play_static_game(rng: Rng, net: &Arc<Net>, gc: &GameCfg, data: &mut Data) {
     let mut game = Game::new(rng, gc);
     assert!(game.next_solve(net).is_none(), "SoG self-play runs through SolveFarm");
     game.finish();
-    data.merge(game.take_data());
+    data.merge(game.take_ready());
 }
 pub(crate) fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) -> Action {
     debug_assert!(matches!(
