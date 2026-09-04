@@ -17,7 +17,7 @@ class Cfg:
     lr: float = 1e-3
     lr_final: float = 1e-4
     lr_stable_frac: float = 0.75
-    replay_ratio: float = 8.0
+    replay_ratio: float = 6.0
     target_every: float = 5.0
     recent_mix: float = 0.5
     recent_frac: float = 0.2
