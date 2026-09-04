@@ -54,6 +54,9 @@ class Net(nn.Module):
         self.blk1 = nn.ModuleList([nn.Linear(2 * C, C) for _ in range(BLOCKS)])
         self.blkg = nn.ModuleList([nn.Linear(2 * C, C) for _ in range(BLOCKS)])
         self.blk2 = nn.ModuleList([nn.Linear(C, C) for _ in range(BLOCKS)])
+        self.dir = nn.ModuleList([nn.Embedding(3, C) for _ in range(BLOCKS)])
+        for d in self.dir:
+            nn.init.ones_(d.weight)
         self.ln1 = nn.ModuleList([nn.LayerNorm(C) for _ in range(BLOCKS)])
         self.ln2 = nn.ModuleList([nn.LayerNorm(C) for _ in range(BLOCKS)])
         self.ln_trunk = nn.LayerNorm(C)
@@ -116,7 +119,7 @@ class Net(nn.Module):
         for i in range(BLOCKS):
             a = gelu(self.ln1[i](x))
             pad = F.pad(a, (0, 0, 0, 1))
-            y = self.blk1[i](torch.cat([a, pad[:, self.nb].sum(2)], -1))
+            y = self.blk1[i](torch.cat([a, (pad[:, self.nb] * self.dir[i].weight.repeat_interleave(2, 0)).sum(2)], -1))
             y = y + self.blkg[i](torch.cat([a.mean(1), a.amax(1)], -1)).unsqueeze(1)
             x = x + self.blk2[i](gelu(self.ln2[i](y)))
         return gelu(self.ln_trunk(x))
@@ -189,7 +192,7 @@ class Net(nn.Module):
 
     def flat(self):
         blocks = [m for i in range(BLOCKS)
-                  for m in (self.blk1[i], self.blkg[i], self.blk2[i])]
+                  for m in (self.blk1[i], self.blkg[i], self.blk2[i], self.dir[i])]
         mats = [
             self.card1, self.card2, self.pile, self.seat,
             self.hex_stem, self.tok_stem, self.pos, self.glob_stem,
