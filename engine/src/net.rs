@@ -21,7 +21,7 @@ fn dense(w: &[f32], b: &[f32], i: usize, o: usize, input: &[f32], rows: usize, o
 
 pub const TYPE: usize = 64;
 pub const C: usize = 96;
-pub const BLOCKS: usize = 8;
+pub const BLOCKS: usize = 12;
 pub const D: usize = 256;
 pub const POOL: usize = 64;
 pub const CFGH: usize = 128;

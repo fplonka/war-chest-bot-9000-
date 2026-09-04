@@ -21,7 +21,7 @@ LOOSE = warchest.LOOSE
 
 TYPE = 64
 C = 96
-BLOCKS = 8
+BLOCKS = 12
 D = 256
 POOL = 64
 CFGH = 128
