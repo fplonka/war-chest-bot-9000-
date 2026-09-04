@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import warchest
 import config
 from export_weights import load as load_checkpoint
-from value_net import Net
+from value_net import BINS, Net
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -299,12 +299,19 @@ def forward_values(net, parts):
     return net(*parts[:4], parts[5])
 
 
+def bins(y):
+    edges = torch.linspace(-1.0, 1.0, BINS + 1, device=y.device)
+    cdf = torch.special.ndtr((edges - y.unsqueeze(1)) * (BINS / 1.5))
+    return cdf.diff(dim=1) / (cdf[:, -1:] - cdf[:, :1])
+
+
 def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
-    v, pieces = net.evaluate(xpub, phi, w, seg, nseg)
+    logits, pieces = net.evaluate(xpub, phi, w, seg, nseg)
+    v = net.value(logits).detach()
     expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
-    expected.index_add_(0, seg, v.detach() * w)
+    expected.index_add_(0, seg, v * w)
     residual = expected[0::2] + expected[1::2]
-    per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
+    per = -(bins(y) * logits.log_softmax(-1)).sum(1)
     total = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     total.index_add_(0, seg, per)

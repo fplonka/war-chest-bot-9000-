@@ -27,6 +27,7 @@ pub const POOL: usize = 64;
 pub const CFGH: usize = 128;
 pub const JW: usize = 128;
 pub const JBLOCKS: usize = 3;
+pub const BINS: usize = 16;
 pub const JOIN_IN: usize = 2 * POOL + 1;
 pub const AW: usize = C;
 
@@ -83,7 +84,7 @@ pub struct NetLayout {
     pub join_b: Span,
     pub join_w: [Span; JBLOCKS],
     pub join_out: Span,
-    pub value_bias: usize,
+    pub value_out: Span,
     pub norms: Vec<NormSpan>,
     pub w_len: usize,
     pub b_len: usize,
@@ -167,11 +168,7 @@ impl NetLayout {
             join_w: std::array::from_fn(|_| c.lin(JW, JW, true)),
             join_out: c.lin(JW, D, true),
             act_h: c.lin(D, AW, false),
-            value_bias: {
-                let at = c.b;
-                c.b += 1;
-                at
-            },
+            value_out: c.lin(D, BINS, true),
             norms: norm_widths()
                 .into_iter()
                 .map(|width| {

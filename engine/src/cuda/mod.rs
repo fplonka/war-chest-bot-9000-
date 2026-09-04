@@ -14,7 +14,7 @@ use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use crate::board::{board, N_HEXES, NONE};
 use crate::contract::{Call, Prime, Reply};
 use crate::net::{
-    ln_block, Net, NetLayout, NormSpan, Span, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
+    ln_block, Net, NetLayout, NormSpan, Span, AW, BINS, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
@@ -702,6 +702,7 @@ fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOption
         format!("-DJ_POOL={POOL}"),
         format!("-DJ_D={D}"),
         format!("-DJ_BLOCKS={JBLOCKS}"),
+        format!("-DBINS={BINS}"),
         format!("-DMAX_COINS={MAX_COINS:.1}f"),
     ]);
     CompileOptions {
@@ -1930,7 +1931,8 @@ impl Card {
             let q0_i = q0 as i32;
             let rows = 2 * n;
             let rows_i = rows as i32;
-            let bias = self.b.slice(l.value_bias..l.value_bias + 1);
+            let out = self.w.slice(l.value_out.w..l.value_out.w + D * BINS);
+            let bias = self.b.slice(l.value_out.b..l.value_out.b + BINS);
             let hn = l.norms[LN_H];
             let g = self.ln.slice(hn.g..hn.g + hn.width);
             let hb = self.ln.slice(hn.b..hn.b + hn.width);
@@ -1939,7 +1941,7 @@ impl Card {
                         .launch_builder(&self.k.leaf)
                         .arg(trees).arg(part_d).arg(local_d).arg(base_d).arg(coff_d)
                         .arg(&self.jw).arg(&join_ln).arg(&self.owed)
-                        .arg(&bias).arg(&g).arg(&hb)
+                        .arg(&out).arg(&bias).arg(&g).arg(&hb)
                         .arg(&rows_i).arg(&q0_i)
                         .launch_unit(LaunchConfig {
                             grid_dim: ((rows as u32).div_ceil(JROWS as u32), 1, 1),

@@ -27,6 +27,7 @@ POOL = 64
 CFGH = 128
 JW = 128
 JBLOCKS = 3
+BINS = 16
 N_KINDS = warchest.N_KINDS
 ACT_BYTES = warchest.ACT_BYTES
 
@@ -82,7 +83,9 @@ class Net(nn.Module):
         self.ln_jout = nn.LayerNorm(JW)
         self.join_out = nn.Linear(JW, D)
         self.ln_h = nn.LayerNorm(D)
-        self.value_bias = nn.Parameter(torch.zeros(1))
+        self.value_out = nn.Linear(D, BINS)
+        nn.init.zeros_(self.value_out.weight)
+        nn.init.zeros_(self.value_out.bias)
 
         nn.init.normal_(self.cfg_f.weight, std=1e-3)
         nn.init.zeros_(self.cfg_f.bias)
@@ -90,6 +93,8 @@ class Net(nn.Module):
         nb = torch.as_tensor(warchest.hex_neighbours(), dtype=torch.long)
         self.register_buffer("nb", nb.view(N_HEXES, 6), persistent=False)
         self.register_buffer("seat_of", torch.arange(NTYPE) // NSLOT,
+                             persistent=False)
+        self.register_buffer("centres", (torch.arange(BINS) + 0.5) / (BINS / 2) - 1,
                              persistent=False)
 
 
@@ -180,11 +185,14 @@ class Net(nn.Module):
         own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
         f, g, fp = self.configs(phi, own, seg)
         h = self.heads(board, g, weight, seg, nseg)
-        value = (f * h[seg]).sum(1) + self.value_bias
-        return value, (cards, board, projected, spatial, fp, h)
+        logits = self.value_out(f * h[seg])
+        return logits, (cards, board, projected, spatial, fp, h)
+
+    def value(self, logits):
+        return logits.softmax(-1) @ self.centres
 
     def forward(self, xpub, phi, weight, seg, nseg):
-        return self.evaluate(xpub, phi, weight, seg, nseg)[0]
+        return self.value(self.evaluate(xpub, phi, weight, seg, nseg)[0])
 
 
     def flat(self):
@@ -198,7 +206,7 @@ class Net(nn.Module):
             self.cfg1, self.cfg_f, self.cfg_g, self.cfg_m,
             self.cfg_p, self.act_kind, self.act_role, self.act_board, self.act_out,
             self.join_p, self.join_b, *self.joinw, self.join_out,
-            self.act_h,
+            self.act_h, self.value_out,
         ]
         norms = [n for i in range(BLOCKS) for n in (self.ln1[i], self.ln2[i])]
         norms += [self.ln_trunk, self.ln_cfg, *self.ln_join,
@@ -211,7 +219,6 @@ class Net(nn.Module):
              for m in mats]
         b = [raw(m.bias) for m in mats
              if not isinstance(m, nn.Embedding) and m.bias is not None]
-        b.append(raw(self.value_bias))
         ln = [x for n in norms for x in (raw(n.weight), raw(n.bias))]
         f = lambda xs: np.ascontiguousarray(np.concatenate(xs), np.float32)
         return f(w), f(b), f(ln)

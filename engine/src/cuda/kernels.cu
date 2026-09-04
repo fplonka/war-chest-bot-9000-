@@ -694,7 +694,8 @@ __global__ __launch_bounds__(32 * J_SPAN, 2)
 void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
             const int* base_of_part, const unsigned int* coff,
             const float* wj, const float* lnj, const float* owed,
-            const float* cf_bias, const float* gamma, const float* beta,
+            const float* value_out, const float* cf_bias,
+            const float* gamma, const float* beta,
             int rows, int q0) {
     __shared__ __align__(16) float shared[J_ROWS * J_D];
     float* act = shared;
@@ -837,17 +838,31 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
         unsigned int node = t.leaf_node[local_row[r]];
         unsigned int lo = coff[2 * r + traverser], hi = coff[2 * r + traverser + 1];
         unsigned int cs = t.coff[2 * local_row[r] + traverser];
-        float bias = *cf_bias;
         float* opinion = t.opinion + traverser * t.nvals;
         unsigned int vo = t.voff[node];
         for (unsigned int k = lo; k < hi; ++k) {
             const float* fr = t.f + (size_t)t.cidx[cs + k - lo] * J_D;
-            float acc = 0.0f;
+            float p[J_D / 32];
 #pragma unroll
-            for (int q = 0; q < J_D / 32; ++q) acc += fr[lane + 32 * q] * h[q];
-            for (int s = 16; s > 0; s >>= 1)
-                acc += __shfl_down_sync(0xffffffff, acc, s);
-            if (lane == 0) opinion[vo + k - lo] = acc + bias;
+            for (int q = 0; q < J_D / 32; ++q) p[q] = fr[lane + 32 * q] * h[q];
+            float logit[BINS], top = -1e30f;
+#pragma unroll
+            for (int b = 0; b < BINS; ++b) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int q = 0; q < J_D / 32; ++q)
+                    acc += p[q] * value_out[(lane + 32 * q) * BINS + b];
+                logit[b] = warp_sum(acc) + cf_bias[b];
+                top = fmaxf(top, logit[b]);
+            }
+            float norm = 0.0f, mean = 0.0f;
+#pragma unroll
+            for (int b = 0; b < BINS; ++b) {
+                float e = __expf(logit[b] - top);
+                norm += e;
+                mean += e * ((b + 0.5f) * (2.0f / BINS) - 1.0f);
+            }
+            if (lane == 0) opinion[vo + k - lo] = mean / norm;
         }
     }
 }
