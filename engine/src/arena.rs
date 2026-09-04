@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::actions::Action;
 use crate::rng::Rng;
 use crate::selfplay::resolve_chance;
-use crate::state::{Cont, State, BLACK, WHITE};
+use crate::state::{State, BLACK, WHITE};
 use crate::units::index_of_id;
 
 pub const PROTOCOL: u32 = 6;
@@ -108,7 +108,6 @@ struct Bout {
     asked: [bool; 2],
     watched: [bool; 2],
     over: bool,
-    main_plays: u16,
 }
 
 #[derive(Default)]
@@ -155,7 +154,6 @@ impl Table {
                 asked: [false, false],
                 watched: [false, false],
                 over: false,
-                main_plays: 0,
             },
         );
         Ok(())
@@ -180,10 +178,9 @@ impl Table {
                 });
                 b.pending[1 - player as usize].push(Obs::Draw { player, code: None });
             }
-            if crate::finished(&b.s, b.main_plays) {
+            if b.s.is_terminal() {
                 b.over = true;
-                let z = if b.s.is_terminal() { b.s.utility(WHITE as usize) } else { 0.0 };
-                ended.push((id, b.bots, z));
+                ended.push((id, b.bots, b.s.utility(WHITE as usize)));
             } else if drew {
                 fresh.push((id, b.s, b.draft.clone()));
             }
@@ -219,11 +216,10 @@ impl Table {
             return Err(format!("game {id}: illegal action {action:?}"));
         }
         let player = b.s.to_act();
-        b.main_plays += matches!(b.s.pending(), Cont::MainPlay) as u16;
         b.s.apply_inplace(action);
         b.watched = [false, false];
-        let live = !crate::finished(&b.s, b.main_plays) && !b.s.is_chance();
-        let reached = live.then_some((id, b.s, b.draft.clone()));
+        let reached =
+            (!b.s.is_terminal() && !b.s.is_chance()).then_some((id, b.s, b.draft.clone()));
         b.pending[1 - player as usize].push(Obs::Act {
             player,
             key: crate::pbs::obs_key(&action),
@@ -239,7 +235,7 @@ impl Table {
     pub fn request(&mut self, bot: usize) -> Request {
         let (mut go, mut watch) = (Vec::new(), Vec::new());
         for (&id, b) in self.bouts.iter_mut() {
-            if crate::finished(&b.s, b.main_plays) || b.s.is_chance() {
+            if b.s.is_terminal() || b.s.is_chance() {
                 continue;
             }
             let Some(seat) = b.bots.iter().position(|&x| x == bot) else {

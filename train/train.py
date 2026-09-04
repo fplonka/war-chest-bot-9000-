@@ -299,32 +299,36 @@ def forward_values(net, parts):
     return net(*parts[:4], parts[5])
 
 
-def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
+def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     v, pieces = net.evaluate(xpub, phi, w, seg, nseg)
-    expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
-    expected.index_add_(0, seg, v.detach() * w)
-    residual = expected[0::2] + expected[1::2]
+    if stats is not None:
+        expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
+        expected.index_add_(0, seg, v.detach() * w)
+        residual = expected[0::2] + expected[1::2]
+        maximum, square_sum = torch.stack([
+            residual.abs().max(), residual.square().sum()]).cpu().tolist()
+        stats["zero_sum_max"] = max(stats["zero_sum_max"], maximum)
+        stats["zero_sum_square_sum"] += square_sum
+        stats["zero_sum_n"] += len(residual)
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
     total = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     total.index_add_(0, seg, per)
     count.index_add_(0, seg, torch.ones_like(per))
     loss = (total / count.clamp(min=1)).mean()
-    stats = {"value_loss": loss.detach(),
-             "zero_sum_max": residual.abs().max(),
-             "zero_sum_square_sum": residual.square().sum()}
+    if stats is not None:
+        stats["value_loss"] = float(loss.detach())
     if policy is not None and wp > 0.0:
-        pl, policy_stats = policy_loss(net, pieces, seg, policy)
+        pl = policy_loss(net, pieces, seg, policy, stats)
         if pl is not None:
             loss = loss + wp * pl
-            stats.update(policy_stats)
-    return loss, stats
+    return loss
 
 
-def policy_loss(net, pieces, seg, policy):
-    desc, parow, pact, _pcrow, pcfg, target, inv, groups = policy
+def policy_loss(net, pieces, seg, policy, stats=None):
+    desc, parow, pact, _pcrow, pcfg, target = policy
     if desc.shape[0] == 0 or pact.shape[0] == 0:
-        return None, {}
+        return None
     cards, board, projected, spatial, fp, h = pieces
     action_query = torch.zeros(desc.shape[0], dtype=torch.long, device=desc.device)
     action_query.scatter_(0, pact, seg[pcfg])
@@ -332,25 +336,35 @@ def policy_loss(net, pieces, seg, policy):
 
     logit = (fp[pcfg] * e[pact]).sum(1)
 
-    top = torch.full((groups,), -1e30, device=logit.device)
+    group = pcfg
+    uniq, inv = torch.unique(group, return_inverse=True)
+    top = torch.full((len(uniq),), -1e30, device=logit.device)
     top = top.scatter_reduce(0, inv, logit, reduce="amax")
     ex = (logit - top[inv]).exp()
-    tot = torch.zeros(groups, device=ex.device).index_add_(0, inv, ex)
+    tot = torch.zeros(len(uniq), device=ex.device).index_add_(0, inv, ex)
     logp = (logit - top[inv]) - tot[inv].clamp(min=1e-30).log()
     per = -(target * logp)
-    out = torch.zeros(groups, device=per.device).index_add_(0, inv, per)
+    out = torch.zeros(len(uniq), device=per.device).index_add_(0, inv, per)
     loss = out.mean()
-    target_mass = torch.zeros(groups, device=target.device).index_add_(0, inv, target)
-    q = target / target_mass[inv].clamp(min=1e-30)
-    target_entropy = torch.zeros(groups, device=target.device).index_add_(
-        0, inv, -(q * q.clamp(min=1e-30).log()))
-    prior_entropy = torch.zeros(groups, device=target.device).index_add_(
-        0, inv, -(logp.exp() * logp))
-    search_ce = torch.zeros(groups, device=target.device).index_add_(0, inv, -(q * logp))
-    return loss, {"policy_loss_sum": loss.detach(),
-                  "policy_target_entropy_sum": target_entropy.mean(),
-                  "policy_prior_entropy_sum": prior_entropy.mean(),
-                  "policy_search_kl_sum": (search_ce - target_entropy).mean()}
+    if stats is not None:
+        target_mass = torch.zeros(len(uniq), device=target.device).index_add_(
+            0, inv, target)
+        q = target / target_mass[inv].clamp(min=1e-30)
+        target_entropy = torch.zeros(len(uniq), device=target.device).index_add_(
+            0, inv, -(q * q.clamp(min=1e-30).log()))
+        prior = logp.exp()
+        prior_entropy = torch.zeros(len(uniq), device=target.device).index_add_(
+            0, inv, -(prior * logp))
+        search_ce = torch.zeros(len(uniq), device=target.device).index_add_(
+            0, inv, -(q * logp))
+        values = torch.stack([
+            loss, target_entropy.mean(), prior_entropy.mean(),
+            (search_ce - target_entropy).mean()]).detach().cpu().tolist()
+        stats.update(dict(zip((
+            "policy_loss", "policy_target_entropy", "policy_prior_entropy",
+            "policy_search_kl"), values)))
+        stats["policy_groups"] = len(uniq)
+    return loss
 
 
 @torch.no_grad()
@@ -371,8 +385,8 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
     old = batch_fn(buf.sample_old(batch, rng, recent_frac), rng, device)
     new = batch_fn(buf.sample(batch, rng, recent_mix=1.0, recent_frac=recent_frac),
                    rng, device)
-    out["loss_old"] = float(losses(net, *old, wp=0.0)[0])
-    out["loss_new"] = float(losses(net, *new, wp=0.0)[0])
+    out["loss_old"] = float(losses(net, *old, wp=0.0))
+    out["loss_new"] = float(losses(net, *new, wp=0.0))
     calibration = buf.sample_calibration(batch, rng)
     if calibration is None:
         return out
@@ -393,14 +407,6 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
     return out
 
 
-def accumulate(acc, stats):
-    for key, value in stats.items():
-        if key.endswith("_max") and key in acc:
-            acc[key] = torch.maximum(acc[key], value)
-        else:
-            acc[key] = acc.get(key, 0) + value
-
-
 def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
                 batch_fn=None, policy_w=0.0, deadline=None):
@@ -409,7 +415,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     stat["sample_delays"] = []
     if len(buf) < batch:
         return float("nan"), stat
-    acc = {}
+    tot = 0.0
     event_pairs = []
     stream = torch.cuda.current_stream(device) if profile_cuda and device.type == "cuda" else None
     for _ in range(steps):
@@ -438,30 +444,35 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             f1 = torch.cuda.Event(enable_timing=True)
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
-        loss, step_stat = losses(net, *parts, wp=policy_w)
-        stat["steps"] += 1
-        stat["zero_sum_n"] += parts[5] // 2
-        stat["policy_steps"] += "policy_loss_sum" in step_stat
+        step_stat = {"zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
+                     "zero_sum_n": 0}
+        value = losses(net, *parts, wp=policy_w, stats=step_stat)
+        tot += step_stat["value_loss"]
+        stat["zero_sum_max"] = max(stat["zero_sum_max"], step_stat["zero_sum_max"])
+        stat["zero_sum_square_sum"] += step_stat["zero_sum_square_sum"]
+        stat["zero_sum_n"] += step_stat["zero_sum_n"]
+        if "policy_loss" in step_stat:
+            stat["policy_steps"] += 1
+            for key in POLICY_METRICS:
+                stat[f"{key}_sum"] += step_stat[key]
         if stream is not None:
             f1.record(stream)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        grad_norm = nn.utils.clip_grad_norm_(net.parameters(), 5.0)
-        step_stat.update(grad_norm_sum=grad_norm, grad_norm_max=grad_norm,
-                         grad_clipped=(grad_norm > 5.0).float())
-        accumulate(acc, step_stat)
+        value.backward()
+        grad_norm = float(nn.utils.clip_grad_norm_(net.parameters(), 5.0))
+        stat["grad_norm_sum"] += grad_norm
+        stat["grad_norm_max"] = max(stat["grad_norm_max"], grad_norm)
+        stat["grad_clipped"] += int(grad_norm > 5.0)
         opt.step()
+        stat["steps"] += 1
         if stream is not None:
             b1.record(stream)
             event_pairs.append((f0, f1, b1))
-    if not acc:
-        return float("nan"), stat
-    stat.update(dict(zip(acc, torch.stack([v.float() for v in acc.values()]).tolist())))
     if event_pairs:
         torch.cuda.synchronize(device)
         stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0
         stat["gpu_backward_s"] = sum(b.elapsed_time(c) for _, b, c in event_pairs) / 1000.0
-    return stat.pop("value_loss") / stat["steps"], stat
+    return tot / stat["steps"] if stat["steps"] else float("nan"), stat
 
 
 def ingest(buf, data, warm=False):
@@ -663,8 +674,8 @@ def main():
     y = torch.zeros(k, device=dev)
     parts = (x, phi, w, seg, y, 2 * n, None)
     scratch = Net().to(dev)
-    scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr, fused=True)
-    losses(scratch, *parts, wp=0.0)[0].backward()
+    scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr)
+    losses(scratch, *parts, wp=0.0).backward()
     scratch_opt.step()
     forward_values(scratch, parts)
     torch.cuda.synchronize(dev)
@@ -672,7 +683,7 @@ def main():
 
     torch.manual_seed(args.seed)
     value = Net().to(dev)
-    opt = torch.optim.Adam(value.parameters(), lr=args.lr, fused=True)
+    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
     if checkpoint:
         value.load_state_dict(checkpoint["value"])
@@ -860,7 +871,7 @@ def main():
             window["add_s"] += add_s
             window_shapes.extend(data.get("shapes") or [])
             for name in (
-                    "games", "decisions", "timeouts",
+                    "games", "decisions", "horizon_hits",
                     "white_wins", "black_wins", "draws",
                     "plays_attack", "plays_pass", "plays_deploy",
                     "plays_bolster", "plays_maneuver", "plays_recruit",
@@ -985,7 +996,7 @@ def main():
                 "weight_norm": round(weight_norm, 4),
                 "grad_clip_frac": round(
                     window["grad_clipped"] / max(steps, 1), 4),
-                "timeout_frac": round(window["timeouts"] / games, 3),
+                "horizon_frac": round(window["horizon_hits"] / games, 3),
                 "calls_per_round": round(per_round["round_calls"], 2),
                 "rows_per_round": round(per_round["round_rows"], 1),
                 "device_ms_per_round": round(
@@ -1063,7 +1074,7 @@ def main():
                 f"[t={rec['t']:6.1f}s] GT-CFR solves={sog_solves} "
                 f"rate={raw_sps:.1f}/s rows={rec['rows']} "
                 f"games={rec['games']} "
-                f"W{rec['white_wins']}/B{rec['black_wins']}/D{rec['draws']}/T{int(window['timeouts'])} "
+                f"W{rec['white_wins']}/B{rec['black_wins']}/D{rec['draws']} "
                 f"qrows={rec['query_rows']} "
                 f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
                 f"Lp={rec['policy_loss']:.3f} "
@@ -1090,10 +1101,9 @@ def main():
             f"[GT-CFR-summary] solves={sog_solves} "
             f"optimizer_rows={optimizer_rows} "
             f"rate={sog_solves / elapsed:.1f}/s "
-            f"timeouts={totals['timeouts'] / max(totals['games'], 1):.2f} "
+            f"horizon={totals['horizon_hits'] / max(totals['games'], 1):.2f} "
             f"games={totals['games']} "
-            f"W{totals['white_wins']}/B{totals['black_wins']}"
-            f"/D{totals['draws']}/T{totals['timeouts']}",
+            f"W{totals['white_wins']}/B{totals['black_wins']}/D{totals['draws']}",
             flush=True)
 
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=gt-cfr "
@@ -1137,8 +1147,8 @@ def main():
                 "loss": round(float(lv), 5) if steps else None,
                 "tgt_mean": round(float(cy.mean()) if cy.size else 0.0, 4),
                 "tgt_std": round(float(cy.std()) if cy.size else 0.0, 4),
-                "timeout_frac": round(int(d.get("timeouts", 0)) /
-                                     max(int(d.get("games", 0)), 1), 3),
+                "horizon_frac": round(int(d.get("horizon_hits", 0)) /
+                                      max(int(d.get("games", 0)), 1), 3),
                 "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
             }
             tick(rec,

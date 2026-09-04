@@ -172,7 +172,7 @@ PANELS = (
     ("Gradient clipping", "fraction of steps", (("gradient clipping", "grad_clip_frac"),),
      True, ()),
     ("Replay age", "seconds retained", (("replay age", "buf_s"),), True, ()),
-    ("Games stopped at the play limit", "fraction", (("games stopped", "timeout_frac"),),
+    ("Games cut at horizon", "fraction", (("games cut at horizon", "horizon_frac"),),
      True, ()),
 )
 
@@ -232,15 +232,15 @@ def health(eps):
     if not eps:
         return []
     last, tot = eps[-1], lambda k: sum(e.get(k, 0) for e in eps)
-    stopped_games = max(tot("games"), 1)
-    stopped = 100 * sum(e.get("timeout_frac", 0) * e.get("games", 0)
-                        for e in eps) / stopped_games
+    horizon_games = max(tot("games"), 1)
+    horizon = 100 * sum(e.get("horizon_frac", 0) * e.get("games", 0)
+                        for e in eps) / horizon_games
     return [("wall clock", f"{last.get('t', 0) / 60:.0f} min"),
             ("solves", f"{tot('solves'):,}"),
             ("solves/s", f"{last.get('solves_per_s', 0):.0f}"),
             ("buffer", f"{last.get('buf', 0):,}"),
             ("dropped queries", f"{tot('dropped'):,}"),
-            ("games stopped", f"{stopped:.1f}%"),
+            ("games cut at horizon", f"{horizon:.1f}%"),
             ("effective train ratio", f"{last.get('effective_train_ratio', 0):.3f} /solve"),
             ("passes per row", f"{last.get('train_row_ratio', 0):.3f}"),
             ("gradient norm / clipped",
