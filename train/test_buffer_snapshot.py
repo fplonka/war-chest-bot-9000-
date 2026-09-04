@@ -92,8 +92,7 @@ def chunk(train, start, n):
         np.full(nc, 1.0 / nc, np.float32)
         for nc in nc_row if nc
     ])
-    pq = (np.arange(len(pprob)) % 5 / 4.0 - 0.5).astype(np.float16)
-    policy = (pa, paoff, pcoff, pci, pact, pprob, pq)
+    policy = (pa, paoff, pcoff, pci, pact, pprob)
     return (rows, cc, cw, cy, coff, boundaries, source, truth, outcome,
             created, td1, policy)
 

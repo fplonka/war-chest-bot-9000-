@@ -103,7 +103,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     arrays! {
         rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, coff = d.coff,
         pa = d.pa, paoff = d.paoff, pcoff = d.pcoff, pci = d.pci,
-        pcell = d.pcell, pprob = d.pprob, pq = d.pq, truth = d.truth, outcome = d.outcome,
+        pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome,
         created = d.created, query = d.query, td1 = d.td1, soff = soff,
     }
     out.set_item("row_bytes", crate::pbs::ROW_BYTES)?;

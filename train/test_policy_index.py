@@ -30,13 +30,13 @@ def dump(n, ncfg, na, ncells):
     outcome = np.full((n, 2), np.nan, np.float32)
     created = np.zeros(n, np.float64)
     td1 = np.zeros(n, np.uint8)
-    pol = (pa, paoff, pcoff, pci, pact, pprob, np.zeros(n * ncells, np.float16))
+    pol = (pa, paoff, pcoff, pci, pact, pprob)
     return rows, cc, cw, cy, coff, soff, source, truth, outcome, created, td1, pol
 
 
 def check(buf, ids):
     _x, cc, _cp, _cw, _cy, _seg, pol = buf.gather(ids)
-    pa, pact, _pcrow, pcfg, _pp, _parow, _pq = pol
+    pa, pact, _pcrow, pcfg, _pp, _parow = pol
     n_cfg, n_act = len(cc), len(pa)
     assert pcfg.size == 0 or int(pcfg.max()) < n_cfg, (int(pcfg.max()), n_cfg)
     assert pact.size == 0 or int(pact.max()) < n_act, (int(pact.max()), n_act)

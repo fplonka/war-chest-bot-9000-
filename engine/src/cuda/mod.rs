@@ -1842,11 +1842,14 @@ impl Card {
             for &(at, n) in vals_at {
                 root.extend(s.ent[Ent::Reach as usize].get_f32(&self.stream, R_VALS, at as usize, n as usize, &mut h)?);
             }
-            let cells = &s.ent[Ent::Cell as usize];
-            let (at, n) = (policy_at.0 as usize, policy_at.1 as usize);
-            let policy = cells.get_f32(&self.stream, C_SUM, at, n, &mut h)?;
-            let q = cells.get_f32(&self.stream, C_QVAL, at, n, &mut h)?;
-            out.push((i, Reply { a: root, b: policy, q, ..Default::default() }));
+            let policy = s.ent[Ent::Cell as usize].get_f32(
+                &self.stream,
+                C_SUM,
+                policy_at.0 as usize,
+                policy_at.1 as usize,
+                &mut h,
+            )?;
+            out.push((i, Reply { a: root, b: policy, ..Default::default() }));
         }
         Ok(())
     }

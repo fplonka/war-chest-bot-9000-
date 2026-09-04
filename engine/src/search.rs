@@ -329,7 +329,6 @@ pub struct Policy {
     pub off: Vec<u32>,
     pub act: Vec<u16>,
     pub p: Vec<f32>,
-    pub q: Vec<f32>,
 }
 
 pub const ACT_BYTES: usize = 6;
@@ -491,7 +490,6 @@ pub struct Solver {
     pub root_belief: [Belief; 2],
     pub cur: Vec<f32>,
     pub avg: Vec<f32>,
-    root_q: Vec<f32>,
     pub grown: Vec<u32>,
     pub(crate) avg_touched: [bool; 2],
     pub counts: Counts,
@@ -1356,7 +1354,6 @@ impl Solver {
         let (at, cells) = self.root_cells();
         self.avg = vec![0.0; at + cells];
         self.avg[at..at + cells].copy_from_slice(&r.b);
-        self.root_q = r.q.clone();
         self.collect?;
         let n0 = self.nodes[0].nc[0] as usize;
         let value = [r.a[..n0].to_vec(), r.a[n0..].to_vec()];
@@ -1476,7 +1473,6 @@ impl Solver {
             for cell in n.legal_row(c) {
                 out.act.push(n.legal_action[cell] as u16);
                 out.p.push(self.avg[so + cell]);
-                out.q.push(self.root_q[cell]);
             }
             out.off.push(out.act.len() as u32);
         }
