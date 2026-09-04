@@ -289,10 +289,6 @@ impl Game {
         }
     }
 
-    pub fn is_terminal(&self) -> bool {
-        self.s.is_terminal()
-    }
-
     pub fn next_solve(&mut self, nets: &Arc<Net>) -> Option<Solver> {
         loop {
             if crate::finished(&self.s, self.main_plays) {
@@ -310,6 +306,7 @@ impl Game {
             }
             self.data.decisions += 1;
             self.data.configs += self.bel[player as usize].cfg.len();
+            self.main_plays += matches!(self.s.pending(), Cont::MainPlay) as u16;
             match self.gc.agents[player as usize] {
                 Agent::Random => {
                     let cfgs = self.bel[player as usize].cfg.clone();
@@ -366,7 +363,9 @@ impl Game {
     }
 
     fn play(&mut self, mut np: policy::NodePolicy) {
-        self.main_plays += matches!(self.s.pending(), Cont::MainPlay) as u16;
+        if crate::finished(&self.s, self.main_plays) {
+            return;
+        }
         let me = self.s.to_act() as usize;
         np.mix_uniform(self.gc.explore);
         let true_ci = self.true_index(me);
