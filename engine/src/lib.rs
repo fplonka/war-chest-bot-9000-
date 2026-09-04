@@ -21,6 +21,8 @@ pub mod selfplay;
 pub mod state;
 pub mod units;
 
+pub const PLAY_LIMIT: u16 = 256;
+
 pub use actions::Action;
 pub use state::{State, BLACK, WHITE};
 

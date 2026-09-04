@@ -861,7 +861,7 @@ def main():
             window["add_s"] += add_s
             window_shapes.extend(data.get("shapes") or [])
             for name in (
-                    "games", "decisions", "horizon_hits",
+                    "games", "decisions", "timeouts",
                     "white_wins", "black_wins", "draws",
                     "plays_attack", "plays_pass", "plays_deploy",
                     "plays_bolster", "plays_maneuver", "plays_recruit",
@@ -986,7 +986,7 @@ def main():
                 "weight_norm": round(weight_norm, 4),
                 "grad_clip_frac": round(
                     window["grad_clipped"] / max(steps, 1), 4),
-                "horizon_frac": round(window["horizon_hits"] / games, 3),
+                "timeout_frac": round(window["timeouts"] / games, 3),
                 "calls_per_round": round(per_round["round_calls"], 2),
                 "rows_per_round": round(per_round["round_rows"], 1),
                 "device_ms_per_round": round(
@@ -1064,7 +1064,7 @@ def main():
                 f"[t={rec['t']:6.1f}s] GT-CFR solves={sog_solves} "
                 f"rate={raw_sps:.1f}/s rows={rec['rows']} "
                 f"games={rec['games']} "
-                f"W{rec['white_wins']}/B{rec['black_wins']}/D{rec['draws']} "
+                f"W{rec['white_wins']}/B{rec['black_wins']}/D{rec['draws']}/T{int(window['timeouts'])} "
                 f"qrows={rec['query_rows']} "
                 f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
                 f"Lp={rec['policy_loss']:.3f} "
@@ -1091,9 +1091,10 @@ def main():
             f"[GT-CFR-summary] solves={sog_solves} "
             f"optimizer_rows={optimizer_rows} "
             f"rate={sog_solves / elapsed:.1f}/s "
-            f"horizon={totals['horizon_hits'] / max(totals['games'], 1):.2f} "
+            f"timeouts={totals['timeouts'] / max(totals['games'], 1):.2f} "
             f"games={totals['games']} "
-            f"W{totals['white_wins']}/B{totals['black_wins']}/D{totals['draws']}",
+            f"W{totals['white_wins']}/B{totals['black_wins']}"
+            f"/D{totals['draws']}/T{totals['timeouts']}",
             flush=True)
 
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=gt-cfr "
@@ -1137,8 +1138,8 @@ def main():
                 "loss": round(float(lv), 5) if steps else None,
                 "tgt_mean": round(float(cy.mean()) if cy.size else 0.0, 4),
                 "tgt_std": round(float(cy.std()) if cy.size else 0.0, 4),
-                "horizon_frac": round(int(d.get("horizon_hits", 0)) /
-                                      max(int(d.get("games", 0)), 1), 3),
+                "timeout_frac": round(int(d.get("timeouts", 0)) /
+                                     max(int(d.get("games", 0)), 1), 3),
                 "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
             }
             tick(rec,

@@ -5,7 +5,6 @@ pub const N_PLAYERS: usize = 2;
 pub const HAND_MAX: u8 = 3;
 pub const MARKERS_TOTAL: u8 = 6;
 pub const WIN_MARKERS: u8 = 6;
-pub const MAX_MAIN_PLAYS: u16 = 256;
 pub const Z_BAG: usize = 0;
 pub const Z_HAND: usize = 1;
 pub const Z_FACEUP: usize = 2;
@@ -243,7 +242,6 @@ pub struct State {
     pub first_player: u8,
     pub active: u8,
     pub turns_taken: [u8; N_PLAYERS],
-    pub main_plays: u16,
 
     pub winner: u8,
     pub adjudicated_draw: bool,
@@ -426,7 +424,6 @@ impl State {
             first_player: active,
             active,
             turns_taken: [0; N_PLAYERS],
-            main_plays: 0,
             winner: NONE,
             adjudicated_draw: false,
             pending: Cont::MainPlay,
@@ -508,24 +505,15 @@ pub fn mirror_hex(h: usize) -> usize {
 }
 
 #[cfg(test)]
-mod horizon_tests {
+mod ending_tests {
     use super::*;
-    use crate::actions::Action;
 
     #[test]
-    fn final_main_play_resolves_then_adjudicates_zero_utility_draw() {
-        let mut state = State::blank(WHITE);
-        state.main_plays = MAX_MAIN_PLAYS - 1;
-        state.add_zone(WHITE, Z_HAND, ROYAL_COIN, 1);
-
-        let terminal = state.apply(Action::Pass { coin: ROYAL_COIN });
-
-        assert!(terminal.is_terminal());
-        assert!(terminal.adjudicated_draw);
-        assert_eq!(terminal.main_plays, MAX_MAIN_PLAYS);
-        assert_eq!(terminal.winner(), None);
-        assert_eq!(terminal.utility(WHITE as usize), 0.0);
-        assert_eq!(terminal.utility(BLACK as usize), 0.0);
-        assert_eq!(terminal.zones[WHITE as usize][Z_FACEDOWN][ROYAL_COIN as usize], 1);
+    fn a_board_nobody_can_act_on_is_the_only_drawn_ending() {
+        let mut empty = State::blank(WHITE);
+        empty.start_round_draws();
+        assert!(empty.is_terminal());
+        assert_eq!(empty.winner(), None);
+        assert_eq!(empty.utility(WHITE as usize), 0.0);
     }
 }

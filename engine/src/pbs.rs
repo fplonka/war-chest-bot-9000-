@@ -618,8 +618,8 @@ pub const ROW_BAG_SIZE: usize = ROW_FD_SIZE + 2;
 pub const ROW_INITIATIVE: usize = ROW_BAG_SIZE + 2;
 pub const ROW_INIT_MOVED: usize = ROW_INITIATIVE + 1;
 pub const ROW_TO_ACT: usize = ROW_INIT_MOVED + 1;
-pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
-pub const ROW_STACK_KIND: usize = ROW_PLIES + 2;
+pub const ROW_WP: usize = ROW_TO_ACT + 1;
+pub const ROW_STACK_KIND: usize = ROW_WP + 1;
 pub const ROW_STACK_OWED: usize = ROW_STACK_KIND + CONT_CAP;
 pub const ROW_BYTES: usize = ROW_STACK_OWED + CONT_CAP * 8;
 
@@ -713,8 +713,7 @@ pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     out[ROW_INITIATIVE] = s.initiative;
     out[ROW_INIT_MOVED] = s.initiative_moved as u8;
     out[ROW_TO_ACT] = s.to_act();
-    let plies = crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS);
-    out[ROW_PLIES..ROW_PLIES + 2].copy_from_slice(&plies.to_le_bytes());
+    out[ROW_WP] = s.wp_v2_triggered as u8;
     let (kinds, owed) = stack_bits(s);
     out[ROW_STACK_KIND..ROW_STACK_KIND + CONT_CAP].copy_from_slice(&kinds);
     for d in 0..CONT_CAP {
@@ -785,7 +784,7 @@ pub fn expand_row(row: &[u8], out: &mut [f32]) {
     let initiative = if row[ROW_INITIATIVE] > 1 { 0 } else { row[ROW_INITIATIVE] };
     let initiative_moved = row[ROW_INIT_MOVED] != 0;
     let to_act = row[ROW_TO_ACT];
-    let plies_remaining = u16::from_le_bytes([row[ROW_PLIES], row[ROW_PLIES + 1]]);
+    let wp_v2_triggered = row[ROW_WP] != 0;
     let (kinds, owed) = stack_from_row(row);
     let (kinds, owed) = (&kinds, &owed);
     debug_assert_eq!(out.len(), PUBFEAT);
@@ -843,7 +842,7 @@ pub fn expand_row(row: &[u8], out: &mut [f32]) {
         i += PLAYER_SCALARS;
     }
 
-    out[i] = plies_remaining as f32 / crate::state::MAX_MAIN_PLAYS as f32;
+    out[i] = wp_v2_triggered as u8 as f32;
     out[i + 1] = initiative_moved as u8 as f32;
     out[i + 2] = (to_act == 0) as u8 as f32;
     for d in 0..CONT_CAP {

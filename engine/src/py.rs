@@ -67,7 +67,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         ("white_wins", d.wins[0]),
         ("black_wins", d.wins[1]),
         ("draws", d.draws),
-        ("horizon_hits", d.cap_hits),
+        ("timeouts", d.timeouts),
         ("configs", d.configs),
         ("query_rows", d.queries),
         ("dropped", d.dropped),
@@ -369,7 +369,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
     m.add_function(wrap_pyfunction!(hex_location_flags, m)?)?;
     m.add_class::<SolveFarm>()?;
-    m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
     m.add("PUBFEAT", crate::pbs::PUBFEAT)?;
     m.add("CFEAT", crate::pbs::CFEAT)?;
     m.add("CCOUNTS", crate::pbs::CCOUNTS)?;

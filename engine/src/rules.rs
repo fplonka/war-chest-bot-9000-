@@ -189,10 +189,6 @@ impl State {
     }
 
     pub fn begin_main_turn(&mut self) {
-        if self.main_plays >= crate::state::MAX_MAIN_PLAYS {
-            self.adjudicated_draw = true;
-            return;
-        }
         let a = self.active;
         let o = other(a);
         if self.hand_size(a) > 0 {
@@ -738,7 +734,6 @@ impl State {
 
         match self.pending {
             Cont::MainPlay => {
-                self.main_plays += 1;
                 self.apply_main(self.active, action);
             }
             Cont::WarriorPriestPlay { player } => {

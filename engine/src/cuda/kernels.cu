@@ -62,8 +62,7 @@ __global__ void k_expand_rows(const unsigned char* rows, const float* cards,
             }
         } else {
             int g = j - OFF_LOOSE - 2 * PLAYER_SCALARS;
-            if (g == 0)
-                v = (row[ROW_PLIES] | (row[ROW_PLIES + 1] << 8)) / (float)MAX_MAIN_PLAYS;
+            if (g == 0) v = row[ROW_WP];
             else if (g == 1) v = row[ROW_INIT_MOVED];
             else if (g == 2) v = row[ROW_TO_ACT] == 0;
             else {

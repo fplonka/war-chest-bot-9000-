@@ -21,11 +21,11 @@ use crate::pbs::{
     CFEAT, HEX_BLOCK, HEX_CH, HEX_FACTS, LOOSE, MAX_COINS, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
     OFF_PILES, PILE_COUNTS, PLAYER_SCALARS, PUBFEAT, ROW_BAG_SIZE, ROW_BYTES, ROW_FD_SIZE,
     ROW_HAND_SIZE, ROW_HEX_HEIGHT, ROW_HEX_MARKER, ROW_HEX_OWNER, ROW_HEX_SLOT, ROW_IDS,
-    ROW_INITIATIVE, ROW_INIT_MOVED, ROW_PILES, ROW_PLIES, ROW_STACK_KIND, ROW_STACK_OWED,
+    ROW_INITIATIVE, ROW_INIT_MOVED, ROW_PILES, ROW_STACK_KIND, ROW_STACK_OWED, ROW_WP,
     ROW_TO_ACT,
 };
 use crate::search::{Cfg, Cfr, Ent};
-use crate::state::{CONT_CAP, MAX_MAIN_PLAYS, PENDING_KINDS};
+use crate::state::{CONT_CAP, PENDING_KINDS};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 mod slot;
@@ -689,7 +689,7 @@ fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOption
         ROW_BYTES, PUBFEAT, N_HEXES, HEX_CH, HEX_FACTS, HEX_BLOCK, NTYPE, NSLOT, PILE_COUNTS,
         CARD_FEATS, OFF_PILES, OFF_CARDS, OFF_LOOSE, PLAYER_SCALARS, ROW_IDS, ROW_HEX_OWNER,
         ROW_HEX_SLOT, ROW_HEX_HEIGHT, ROW_HEX_MARKER, ROW_PILES, ROW_HAND_SIZE, ROW_FD_SIZE,
-        ROW_BAG_SIZE, ROW_INITIATIVE, ROW_INIT_MOVED, ROW_TO_ACT, ROW_PLIES, ROW_STACK_KIND,
+        ROW_BAG_SIZE, ROW_INITIATIVE, ROW_INIT_MOVED, ROW_TO_ACT, ROW_WP, ROW_STACK_KIND,
         ROW_STACK_OWED, PENDING_KINDS, CONT_CAP, TRUNK_ROWS,
     ];
     options.extend([
@@ -702,7 +702,6 @@ fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOption
         format!("-DJ_POOL={POOL}"),
         format!("-DJ_D={D}"),
         format!("-DJ_BLOCKS={JBLOCKS}"),
-        format!("-DMAX_MAIN_PLAYS={}", MAX_MAIN_PLAYS as usize),
         format!("-DMAX_COINS={MAX_COINS:.1}f"),
     ]);
     CompileOptions {

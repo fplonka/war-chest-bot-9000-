@@ -71,7 +71,7 @@ pub struct Data {
     pub decisions: usize,
     pub wins: [usize; 2],
     pub draws: usize,
-    pub cap_hits: usize,
+    pub timeouts: usize,
     pub configs: usize,
     pub queries: usize,
     pub dropped: usize,
@@ -103,7 +103,7 @@ impl Data {
         self.wins[0] += o.wins[0];
         self.wins[1] += o.wins[1];
         self.draws += o.draws;
-        self.cap_hits += o.cap_hits;
+        self.timeouts += o.timeouts;
         self.configs += o.configs;
         self.queries += o.queries;
         self.dropped += o.dropped;
@@ -194,6 +194,7 @@ pub struct Game {
     data: Data,
     gc: GameCfg,
     queries: Vec<(State, [Belief; 2])>,
+    main_plays: u16,
 }
 
 fn draw_count(rng: &mut Rng, rate: f32) -> usize {
@@ -258,6 +259,7 @@ impl Game {
             data: Data::default(),
             gc: *gc,
             queries: Vec::new(),
+            main_plays: 0,
         }
     }
 
@@ -266,7 +268,6 @@ impl Game {
     }
 
     pub fn take_data(&mut self) -> Data {
-        assert!(self.s.is_terminal(), "a game gives up its rows only once it has ended");
         std::mem::take(&mut self.data)
     }
 
@@ -288,7 +289,7 @@ impl Game {
 
     pub fn next_solve(&mut self, nets: &Arc<Net>) -> Option<Solver> {
         loop {
-            if self.s.is_terminal() {
+            if self.s.is_terminal() || self.main_plays >= crate::PLAY_LIMIT {
                 return None;
             }
             let player = self.s.to_act();
@@ -370,6 +371,7 @@ impl Game {
     }
 
     fn play(&mut self, mut np: policy::NodePolicy) {
+        self.main_plays += matches!(self.s.pending(), Cont::MainPlay) as u16;
         let me = self.s.to_act() as usize;
         np.mix_uniform(self.gc.explore);
         let true_ci = self.true_index(me);
@@ -382,8 +384,21 @@ impl Game {
         self.s.apply_inplace(np.acts[chosen]);
     }
 
+    fn continuation(&self) -> [f32; 2] {
+        let Some(r) = self.data.nv.checked_sub(1) else {
+            return [0.0; 2];
+        };
+        std::array::from_fn(|p| {
+            self.data.cy[self.data.row_span(r, p).start + self.data.truth[2 * r + p] as usize]
+        })
+    }
+
     pub fn finish(&mut self) -> f32 {
-        let z = [self.s.utility(0), self.s.utility(1)];
+        let z = if self.s.is_terminal() {
+            [self.s.utility(0), self.s.utility(1)]
+        } else {
+            self.continuation()
+        };
         for r in 0..self.data.nv {
             for (p, &outcome) in z.iter().enumerate() {
                 self.data.outcome[2 * r + p] = outcome;
@@ -398,14 +413,12 @@ impl Game {
             }
         }
         self.data.games += 1;
-        if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
-            self.data.cap_hits += 1;
-        }
         match self.s.winner() {
             Some(w) => self.data.wins[w as usize] += 1,
-            None => self.data.draws += 1,
+            None if self.s.is_terminal() => self.data.draws += 1,
+            None => self.data.timeouts += 1,
         }
-        self.s.utility(WHITE as usize)
+        z[WHITE as usize]
     }
 }
 
