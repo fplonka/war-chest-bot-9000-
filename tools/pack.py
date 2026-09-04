@@ -16,12 +16,8 @@ def selected(snapshots):
     if not snapshots:
         return []
     end = snapshots[-1]["t"]
-    targets = [0.0, end / 8, end / 4, end / 2, end]
-    indices = {min(range(len(snapshots)),
-                   key=lambda i: abs(snapshots[i]["t"] - target))
-               for target in targets}
-    indices.add(len(snapshots) - 1)
-    return [snapshots[i] for i in sorted(indices)]
+    picks = [min(snapshots, key=lambda s: abs(s["t"] - end / k)) for k in (4, 2, 1)]
+    return [s for s in snapshots if s in picks]
 
 
 def pack(run):

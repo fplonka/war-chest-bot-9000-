@@ -47,7 +47,7 @@ sync)
     ;;
 pull)
     name=${2:-}
-    filters=(--exclude '*.tmp')
+    filters=(--exclude '*.tmp' --exclude 'snap_*.pt' --exclude bots)
     if [ -z "$name" ]; then
         filters+=(--include '*/' --include '*.html' --include 'plotly.min.js'
                   --include 'log.json' --include 'epochs.jsonl'
