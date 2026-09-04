@@ -578,7 +578,9 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
             float base = 0.0f;
             for (unsigned int cell = a + lane; cell < b; cell += 32) {
                 unsigned int vc = t.cell_val[so + cell];
-                if (vc != NO_ROW) base += vals[vc] * t.avg[so + cell];
+                float av = vc == NO_ROW ? 0.0f : vals[vc];
+                t.qval[so + cell] = av;
+                base += av * t.avg[so + cell];
             }
             base = warp_sum(base);
             if (lane == 0) vals[vi + c] = base;

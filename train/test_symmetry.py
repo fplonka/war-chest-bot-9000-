@@ -17,7 +17,7 @@ def main():
                        [2, 2, 8, 3, 8, 13]], np.uint8)
     policy = (desc, np.asarray([0, 1, 2]), np.asarray([0, 0, 1]),
               np.asarray([0, 1, 2]), np.asarray([0.2, 0.8, 1.0], np.float32),
-              np.asarray([0, 0, 1]))
+              np.asarray([0, 0, 1]), np.asarray([0.1, -0.2, 0.3], np.float32))
     parts = (rows, cc, player, weight, target, seg, policy)
     flipped = np.asarray([True, False])
 

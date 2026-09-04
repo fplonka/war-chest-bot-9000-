@@ -66,6 +66,7 @@ class Net(nn.Module):
         self.cfg_g = nn.Linear(CFGH, POOL)
         self.cfg_m = nn.Linear(TYPE, 3 * POOL, bias=False)
         self.cfg_p = nn.Linear(CFGH, D)
+        self.cfg_q = nn.Linear(CFGH, D)
         self.act_kind = nn.Embedding(N_KINDS, C)
         self.act_role = nn.Embedding(5, C)
         nn.init.normal_(self.act_kind.weight, std=C ** -0.5)
@@ -138,7 +139,7 @@ class Net(nn.Module):
         bag = self.cfg_m(own).reshape(-1, NSLOT, 3, POOL)[seg]
         return (self.cfg_f(u),
                 self.cfg_g(u) + (counts.unsqueeze(-1) * bag).sum((1, 2)),
-                self.cfg_p(u))
+                self.cfg_p(u), self.cfg_q(u))
 
     def actions(self, desc, boards, heads, cards, spatial, board_of, head_of):
         row = board_of
@@ -178,10 +179,10 @@ class Net(nn.Module):
         cards = self.cards(xpub)
         board, projected, spatial = self.position(xpub, self.tokens(xpub, cards))
         own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
-        f, g, fp = self.configs(phi, own, seg)
+        f, g, fp, fq = self.configs(phi, own, seg)
         h = self.heads(board, g, weight, seg, nseg)
         value = (f * h[seg]).sum(1) + self.value_bias
-        return value, (cards, board, projected, spatial, fp, h)
+        return value, (cards, board, projected, spatial, fp, fq, h)
 
     def forward(self, xpub, phi, weight, seg, nseg):
         return self.evaluate(xpub, phi, weight, seg, nseg)[0]

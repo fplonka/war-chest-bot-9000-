@@ -64,12 +64,14 @@ impl NodePolicy {
             off: Vec::with_capacity(ncfg + 1),
             act: Vec::new(),
             p: Vec::new(),
+            q: Vec::new(),
         };
         out.off.push(0);
         for ci in 0..ncfg {
             for cell in self.row(ci) {
                 out.act.push(self.action_at(cell) as u16);
                 out.p.push(self.probs[cell]);
+                out.q.push(f32::NAN);
             }
             out.off.push(out.act.len() as u32);
         }

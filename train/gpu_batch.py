@@ -36,11 +36,12 @@ def make_batch(parts, rng, device):
         n, stream.cuda_stream, ordinal)
 
     phi = t(cc, torch.float32) / float(warchest.CNORM)
-    pa, pact, pcrow, pcfg, pprob, parow = pol
+    pa, pact, pcrow, pcfg, pprob, parow, pq = pol
     groups, inv = np.unique(pcfg, return_inverse=True)
     policy = (t(pa, torch.uint8), t(parow, torch.long),
               t(pact, torch.long), t(pcrow, torch.long), t(pcfg, torch.long),
-              t(pprob, torch.float32), t(inv, torch.long), len(groups))
+              t(pprob, torch.float32), t(pq, torch.float32), t(inv, torch.long),
+              len(groups))
     return (x, phi, t(cw, torch.float32), t(seg, torch.long),
             t(cy, torch.float32), 2 * n, policy)
 
@@ -53,7 +54,7 @@ def warmup(device):
     cc = np.zeros((2, warchest.CCOUNTS), np.uint8)
     empty = (np.zeros((0, warchest.ACT_BYTES), np.uint8),
              np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int64),
-             np.zeros(0, np.float32), np.zeros(0, np.int64))
+             np.zeros(0, np.float32), np.zeros(0, np.int64), np.zeros(0, np.float32))
     parts = (rows, cc, np.asarray([0, 1], np.uint8),
              np.asarray([1.0, 1.0], np.float32), np.zeros(2, np.float32),
              np.asarray([0, 1], np.int64), empty)
