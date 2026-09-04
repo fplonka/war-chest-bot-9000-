@@ -121,7 +121,7 @@ go)
     done
     [ -n "$out" ] || { echo "go needs out=<name>" >&2; exit 1; }
     "$0" sync
-    "$0" start "$out" bash -c "($build_script) && exec bash tools/resume_train.sh $(printf '%q ' "$@")"
+    "$0" start "$out" bash -c "($build_script) && python train/test_parity.py && exec bash tools/resume_train.sh $(printf '%q ' "$@")"
     "$0" follow "$out" "$out"
     ;;
 compare)
