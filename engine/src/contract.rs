@@ -144,6 +144,7 @@ pub struct Reply {
     pub a: Vec<f32>,
     pub b: Vec<f32>,
     pub c: Vec<f32>,
+    pub q: Vec<f32>,
     pub leaves: Vec<u32>,
 }
 

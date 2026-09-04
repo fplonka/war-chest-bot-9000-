@@ -55,6 +55,7 @@ pub struct Data {
     pub pci: Vec<u16>,
     pub pcell: Vec<u16>,
     pub pprob: Vec<f32>,
+    pub pq: Vec<f32>,
 
     pub truth: Vec<u32>,
     pub outcome: Vec<f32>,
@@ -89,7 +90,7 @@ impl Data {
         macro_rules! append {
             ($($name:ident),* $(,)?) => { $( self.$name.extend(o.$name); )* };
         }
-        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query, td1);
+        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, pq, truth, outcome, created, query, td1);
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
@@ -155,7 +156,8 @@ impl Data {
                     let within = if actor == 0 { ci } else { bel[0].len() + ci };
                     self.pci.extend(std::iter::repeat_n(within as u16, row.len()));
                     self.pcell.extend_from_slice(&policy.act[row.clone()]);
-                    self.pprob.extend_from_slice(&policy.p[row]);
+                    self.pprob.extend_from_slice(&policy.p[row.clone()]);
+                    self.pq.extend_from_slice(&policy.q[row]);
                 }
             }
             self.coff.push(self.cw.len() as u32);

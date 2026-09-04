@@ -78,6 +78,7 @@ class Buffer:
         self.pci = np.zeros(self.pcap, np.uint16)
         self.pact = np.zeros(self.pcap, np.uint16)
         self.pp = np.zeros(self.pcap, np.float16)
+        self.pq = np.zeros(self.pcap, np.float16)
         self.written_at = np.zeros(cap, np.float64)
         self.created_at = np.zeros(cap, np.float64)
         self.source = np.zeros(cap, np.uint8)
@@ -96,7 +97,7 @@ class Buffer:
     _ARENAS = (
         ("cstart", "clen", ("cc", "cw", "cy"), "cfgs", "ccap"),
         ("pastart", "palen", ("pa",), "acts", "acap"),
-        ("pcstart", "pclen", ("pci", "pact", "pp"), "cells", "pcap"))
+        ("pcstart", "pclen", ("pci", "pact", "pp", "pq"), "cells", "pcap"))
 
     def state_dict(self):
         ids = np.arange(self.lo, self.rows, dtype=np.int64)
@@ -150,7 +151,7 @@ class Buffer:
         if pol is None:
             na = nc = 0
         else:
-            pa, paoff, pcoff, pci, pact, pprob = pol
+            pa, paoff, pcoff, pci, pact, pprob, pq = pol
             na, nc = len(pa), len(pci)
         while self.lo < self.rows:
             r = self.lo % self.cap
@@ -190,7 +191,7 @@ class Buffer:
                 self.pclen[sl] = clen[i:j]
             self.pa[(np.arange(na) + self.acts) % self.acap] = pa
             at = (np.arange(nc) + self.cells) % self.pcap
-            self.pci[at], self.pact[at], self.pp[at] = pci, pact, pprob
+            self.pci[at], self.pact[at], self.pp[at], self.pq[at] = pci, pact, pprob, pq
             self.acts += na
             self.cells += nc
         self.rows += n
@@ -238,7 +239,8 @@ class Buffer:
         pol = (self.pa[ai % self.acap],
                np.repeat(abase, clen) + self.pact[ci % self.pcap],
                cellrow, pcfg, pp,
-               np.repeat(np.arange(len(ids), dtype=np.int64), alen))
+               np.repeat(np.arange(len(ids), dtype=np.int64), alen),
+               self.pq[ci % self.pcap].astype(np.float32))
         cw = self.cw[at].copy()
         mass = np.bincount(seg, weights=cw, minlength=2 * len(ids)).astype(np.float32)
         cw /= mass[seg]
@@ -299,7 +301,7 @@ def forward_values(net, parts):
     return net(*parts[:4], parts[5])
 
 
-def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
+def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, wq=0.0, stats=None):
     v, pieces = net.evaluate(xpub, phi, w, seg, nseg)
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
@@ -319,17 +321,19 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     if stats is not None:
         stats["value_loss"] = float(loss.detach())
     if policy is not None and wp > 0.0:
-        pl = policy_loss(net, pieces, seg, policy, stats)
+        pl, ql = policy_loss(net, pieces, seg, policy, stats)
         if pl is not None:
             loss = loss + wp * pl
+        if ql is not None:
+            loss = loss + wq * ql
     return loss
 
 
 def policy_loss(net, pieces, seg, policy, stats=None):
-    desc, parow, pact, _pcrow, pcfg, target = policy
+    desc, parow, pact, _pcrow, pcfg, target, qt = policy
     if desc.shape[0] == 0 or pact.shape[0] == 0:
-        return None
-    cards, board, projected, spatial, fp, h = pieces
+        return None, None
+    cards, board, projected, spatial, fp, fq, h = pieces
     action_query = torch.zeros(desc.shape[0], dtype=torch.long, device=desc.device)
     action_query.scatter_(0, pact, seg[pcfg])
     e = net.actions(desc, board, h, projected, spatial, parow, action_query)
@@ -346,6 +350,13 @@ def policy_loss(net, pieces, seg, policy, stats=None):
     per = -(target * logp)
     out = torch.zeros(len(uniq), device=per.device).index_add_(0, inv, per)
     loss = out.mean()
+    known = torch.isfinite(qt)
+    q_loss = None
+    if bool(known.any()):
+        q = (fq[pcfg] * e[pact]).sum(1)
+        q_loss = F.smooth_l1_loss(q[known], qt[known], beta=0.5)
+        if stats is not None:
+            stats["q_loss"] = float(q_loss.detach())
     if stats is not None:
         target_mass = torch.zeros(len(uniq), device=target.device).index_add_(
             0, inv, target)
@@ -364,7 +375,7 @@ def policy_loss(net, pieces, seg, policy, stats=None):
             "policy_loss", "policy_target_entropy", "policy_prior_entropy",
             "policy_search_kl"), values)))
         stats["policy_groups"] = len(uniq)
-    return loss
+    return loss, q_loss
 
 
 @torch.no_grad()
@@ -409,7 +420,7 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
 
 def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
-                batch_fn=None, policy_w=0.0, deadline=None):
+                batch_fn=None, policy_w=0.0, q_w=0.0, deadline=None):
     stat = collections.Counter()
     stat["sample_ages"] = []
     stat["sample_delays"] = []
@@ -446,7 +457,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             f0.record(stream)
         step_stat = {"zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
                      "zero_sum_n": 0}
-        value = losses(net, *parts, wp=policy_w, stats=step_stat)
+        value = losses(net, *parts, wp=policy_w, wq=q_w, stats=step_stat)
         tot += step_stat["value_loss"]
         stat["zero_sum_max"] = max(stat["zero_sum_max"], step_stat["zero_sum_max"])
         stat["zero_sum_square_sum"] += step_stat["zero_sum_square_sum"]
@@ -455,6 +466,9 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             stat["policy_steps"] += 1
             for key in POLICY_METRICS:
                 stat[f"{key}_sum"] += step_stat[key]
+        if "q_loss" in step_stat:
+            stat["q_steps"] += 1
+            stat["q_loss_sum"] += step_stat["q_loss"]
         if stream is not None:
             f1.record(stream)
         opt.zero_grad(set_to_none=True)
@@ -501,7 +515,8 @@ def ingest(buf, data, warm=False):
            np.asarray(data["pcoff"], np.int64),
            np.asarray(data["pci"], np.uint16),
            np.asarray(data["pcell"], np.uint16),
-           np.asarray(data["pprob"], np.float16))
+           np.asarray(data["pprob"], np.float16),
+           np.asarray(data["pq"], np.float16))
     buf.add(x, cc, cw, cy.astype(np.float16), coff, soff,
             source, truth, outcome, created, td1, pol)
     return len(x)
@@ -794,7 +809,7 @@ def main():
             value, opt, buf, nsteps, args.batch, rng, dev,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
-            batch_fn=batcher, policy_w=args.policy_w, deadline=deadline)
+            batch_fn=batcher, policy_w=args.policy_w, q_w=args.q_w, deadline=deadline)
         return lv, time.time() - tt, st
 
     def run_search_pipeline():
@@ -1058,6 +1073,7 @@ def main():
                 "solves_per_s": round(raw_sps, 1),
                 **{key: round(value, 5) for key, value in policy.items()},
                 "policy_weighted_loss": round(args.policy_w * policy["policy_loss"], 5),
+                "q_loss": round(window["q_loss_sum"] / max(int(window["q_steps"]), 1), 5),
                 "budget_hits": int(hits),
                 "entity_hits": {names[i]: ent_hits[i] for i in range(8)},
                 "slots": int(data.get("slots", 0)),
@@ -1077,7 +1093,7 @@ def main():
                 f"W{rec['white_wins']}/B{rec['black_wins']}/D{rec['draws']} "
                 f"qrows={rec['query_rows']} "
                 f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
-                f"Lp={rec['policy_loss']:.3f} "
+                f"Lp={rec['policy_loss']:.3f} Lq={rec['q_loss']:.4f} "
                 f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
                 f"gen={gen_s:.2f}s train={train_s:.2f}s "
                 f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
