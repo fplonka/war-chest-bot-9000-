@@ -24,8 +24,8 @@ class Cfg:
     cap: int = 150_000
     cfgs_per_row: int = 48
     s: int = 512
-    c: float = 8.0
-    round_batch: int = 8
+    c: float = 4.0
+    round_batch: int = 16
     rounds: int = 0
     p_td1: float = 0.2
     query_rate: float = 0.9
