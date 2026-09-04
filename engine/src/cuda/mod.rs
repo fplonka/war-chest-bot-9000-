@@ -15,7 +15,7 @@ use crate::board::{board, N_HEXES, NONE};
 use crate::contract::{Call, Prime, Reply};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
-    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE, VH,
+    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
     CFEAT, HEX_BLOCK, HEX_CH, HEX_FACTS, LOOSE, MAX_COINS, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
@@ -1200,16 +1200,10 @@ impl Card {
         let mut sc = self.scratch.lock();
         sc.h.room(n * D)?;
         sc.z.room(n * JW)?;
-        sc.hexv.room(n * N_HEXES * VH)?;
-        let Scratch { input, projected, x, h, z, hexv, .. } = &mut *sc;
+        let Scratch { input, projected, x, h, z, .. } = &mut *sc;
         let p = h.buf.as_mut().unwrap();
         let jp = z.buf.as_mut().unwrap();
         self.run(self.layout.board_out, input.buf.as_ref().unwrap(), n, &mut *p)?;
-        let hexv = hexv.buf.as_mut().unwrap();
-        self.run(self.layout.value_hex, x.buf.as_ref().unwrap(), n * N_HEXES, hexv)?;
-        let cells_i = (n * N_HEXES * VH) as i32;
-        launch!(self, gelu, n * N_HEXES * VH, &mut *hexv, &cells_i)?;
-        self.lin(self.layout.value_flat, hexv, n, 1.0, &mut *p)?;
         self.run(self.layout.join_p, p, n, &mut *jp)?;
         let mut src = 0;
         let mut g = self.solves.lock();
@@ -2061,7 +2055,6 @@ struct Scratch {
     facts: Arr<f32>,
     occupant: Arr<i32>,
     x: Arr<f32>,
-    hexv: Arr<f32>,
     action: Arr<f32>,
     bag: Arr<f32>,
 }
@@ -2121,7 +2114,6 @@ impl Plan {
             facts: self.arr(TILE * N_HEXES * HEX_FACTS)?,
             occupant: self.arr(TILE * N_HEXES)?,
             x: self.arr(TILE * N_HEXES * C)?,
-            hexv: self.arr(TILE * N_HEXES * VH)?,
             action: self.arr(TILE * AW)?,
             bag: self.arr(n * NTYPE * 3 * POOL)?,
         };

@@ -21,7 +21,6 @@ fn dense(w: &[f32], b: &[f32], i: usize, o: usize, input: &[f32], rows: usize, o
 
 pub const TYPE: usize = 64;
 pub const C: usize = 96;
-pub const VH: usize = 8;
 pub const BLOCKS: usize = 8;
 pub const D: usize = 256;
 pub const POOL: usize = 64;
@@ -70,8 +69,6 @@ pub struct NetLayout {
     pub glob_stem: Span,
     pub blocks: [BlockSpan; BLOCKS],
     pub board_out: Span,
-    pub value_hex: Span,
-    pub value_flat: Span,
     pub cfg1: Span,
     pub cfg_f: Span,
     pub cfg_g: Span,
@@ -156,8 +153,6 @@ impl NetLayout {
                 out: c.lin(C, C, true),
             }),
             board_out: c.lin(2 * C + LOOSE, D, true),
-            value_hex: c.lin(C, VH, true),
-            value_flat: c.lin(N_HEXES * VH, D, false),
             cfg1: c.lin(3 + TYPE, CFGH, true),
             cfg_f: c.lin(CFGH, D, true),
             cfg_g: c.lin(CFGH, POOL, true),
