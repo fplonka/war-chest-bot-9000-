@@ -2,7 +2,7 @@
 set -uo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-export WARCHEST_BOX_DIR=/workspace/curve WARCHEST_BOX_LOCAL_DIR=$here
+export WARCHEST_BOX_DIR=/workspace/smoke WARCHEST_BOX_LOCAL_DIR=$here
 
 for branch in "$@"; do
     tree=$here/../smoke-$branch
