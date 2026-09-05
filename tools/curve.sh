@@ -37,7 +37,17 @@ while :; do
         sleep 60
         continue
     fi
+    if ! "$here/tools/box.sh" true >/dev/null 2>&1; then
+        echo "[$(date +%FT%T)] box unreachable, waiting"
+        sleep 120
+        continue
+    fi
     echo "[$(date +%FT%T)] $branch"
-    candidate "$branch" || echo "| $branch | failed |" >> "$results"
+    candidate "$branch" || {
+        echo "| $branch | failed |" >> "$results"
+        echo "[$(date +%FT%T)] $branch failed, holding the queue"
+        sleep 120
+        continue
+    }
     tail -n +2 "$queue" > "$queue.tmp" && mv "$queue.tmp" "$queue"
 done
