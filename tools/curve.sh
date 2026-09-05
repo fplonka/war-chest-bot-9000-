@@ -8,11 +8,11 @@ results=$here/runs/curve/results.md
 mkdir -p "$here/runs/curve"
 [ -s "$results" ] || printf "| branch | 30 | 60 | 120 | 1h offset | slope per doubling |\n|---|---|---|---|---|---|\n" > "$results"
 
-train() {
-    local branch=$1 seed=$2 tree=$here/../curve-$branch
+run() {
+    local branch=$1 tree=$here/../curve-$branch
+    shift
     git -C "$here" worktree add --force --detach "$tree" "$branch" &&
-        "$tree/tools/box.sh" go --skip-ladder "out=${branch}_s$seed" \
-            minutes=120 snapshot_every=30 "seed=$seed"
+        "$tree/tools/box.sh" go --skip-ladder "$@"
     local status=$?
     git -C "$here" worktree remove --force "$tree"
     return $status
@@ -20,7 +20,10 @@ train() {
 
 candidate() {
     local branch=$1
-    train "$branch" 1 && train "$branch" 2 || return 1
+    "$here/tools/box.sh" "rm -rf runs/smoke_$branch" &&
+        run "$branch" "out=smoke_$branch" minutes=2 warm_minutes=1 snapshot_every=1 seed=1 &&
+        run "$branch" "out=${branch}_s1" minutes=120 snapshot_every=30 seed=1 &&
+        run "$branch" "out=${branch}_s2" minutes=120 snapshot_every=30 seed=2 || return 1
     if [ "$branch" = master ]; then
         "$here/tools/box.sh" compare master_s1 master_s2 || return 1
     else
