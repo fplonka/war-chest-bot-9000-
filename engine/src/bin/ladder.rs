@@ -298,7 +298,7 @@ fn run() -> Result<(), String> {
         pairs: Vec::new(),
     };
     for (a, b) in pairs.iter() {
-        let result = play_pair(a, b, games, seed, 128, devices)?;
+        let result = play_pair(a, b, games, seed, 256, devices)?;
         println!(
             "{} vs {}: W{} L{} D{} score {:.3}, Elo {:+.0} [{:+.0}, {:+.0}]",
             result.a,
