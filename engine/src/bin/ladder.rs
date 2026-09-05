@@ -300,8 +300,8 @@ fn run() -> Result<(), String> {
         bots: manifests,
         pairs: Vec::new(),
     };
-    for (index, (a, b)) in pairs.iter().enumerate() {
-        let result = play_pair(a, b, games, seed + index as u64, 128, &devices)?;
+    for (a, b) in pairs.iter() {
+        let result = play_pair(a, b, games, seed, 128, &devices)?;
         println!(
             "{} vs {}: W{} L{} D{} score {:.3}, Elo {:+.0} [{:+.0}, {:+.0}]",
             result.a,
