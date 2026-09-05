@@ -137,12 +137,9 @@ fn play_pair(
     games: usize,
     seed: u64,
     concurrent: usize,
-    devices: &[&str],
+    devices: &str,
 ) -> Result<PairResult, String> {
-    let mut bots = [
-        BotProcess::launch(a, devices[0])?,
-        BotProcess::launch(b, devices[1 % devices.len()])?,
-    ];
+    let mut bots = [BotProcess::launch(a, devices)?, BotProcess::launch(b, devices)?];
     let mut table = Table::new();
     let mut color_pairs = vec![[0.0; 2]; games / 2];
     for (pair, draft) in drafts(seed, games / 2).into_iter().enumerate() {
@@ -281,7 +278,7 @@ fn run() -> Result<(), String> {
     manifests.dedup_by(|x, y| x.name == y.name);
     let games = 400;
     let seed = 83;
-    let devices = ["0", "1"];
+    let devices = "0,1";
     let output = if paths.len() == 1 {
         paths[0].join("ladder.json")
     } else {
@@ -301,7 +298,7 @@ fn run() -> Result<(), String> {
         pairs: Vec::new(),
     };
     for (a, b) in pairs.iter() {
-        let result = play_pair(a, b, games, seed, 128, &devices)?;
+        let result = play_pair(a, b, games, seed, 128, devices)?;
         println!(
             "{} vs {}: W{} L{} D{} score {:.3}, Elo {:+.0} [{:+.0}, {:+.0}]",
             result.a,
