@@ -180,7 +180,7 @@ fn play_pair(
 }
 
 fn paired_elo(outcomes: &[[f32; 2]]) -> (f64, f64, f64) {
-    let point = |x: f32| (x.signum() as f64 + 1.0) / 2.0;
+    let point = |x: f32| f64::from(x > 0.0) + 0.5 * f64::from(x == 0.0);
     let pairs = outcomes.iter().map(|x| (point(x[0]) + point(x[1])) / 2.0);
     let n = outcomes.len() as f64;
     let p = (pairs.clone().sum::<f64>() + 0.5) / (n + 1.0);
