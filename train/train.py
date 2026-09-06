@@ -147,6 +147,7 @@ class Buffer:
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         m = len(cw)
+        ends = np.asarray(soff, np.int64)
         if pol is None:
             na = nc = 0
         else:
@@ -159,7 +160,8 @@ class Buffer:
                     and self.cells - self.pcstart[r] + nc <= self.pcap
                     and self.acts - self.pastart[r] + na <= self.acap):
                 break
-            self.lo += 1
+            self.lo = int(self.soff[0])
+            self.soff = self.soff[1:]
         starts = self.cfgs + coff[:-1:2]
         base = self.rows
         now = time.time()
@@ -195,11 +197,7 @@ class Buffer:
             self.cells += nc
         self.rows += n
         self.cfgs += m
-        self.soff = np.concatenate([self.soff, np.asarray(soff, np.int64)[1:] + base])
-        if self.soff.size:
-            i = int(np.searchsorted(self.soff, self.lo, "right"))
-            if i > self.soff.size // 2:
-                self.soff = self.soff[i:].copy()
+        self.soff = np.concatenate([self.soff, ends[1:] + base])
 
     def span_seconds(self):
         return (time.time() - self.written_at[self.lo % self.cap]
@@ -245,21 +243,34 @@ class Buffer:
         return (self.x[s], self.cc[at], player, cw,
                 self.cy[at].astype(np.float32), seg, pol)
 
+    def _sample_groups(self, batch, rng, lo=0, hi=None):
+        ends = self.soff
+        starts = np.concatenate(([self.lo], ends[:-1]))
+        hi = len(ends) if hi is None else hi
+        groups = rng.integers(lo, hi, size=batch)
+        roots = starts[groups]
+        extras = ends[groups] - roots - 1
+        internal = (extras > 0) & (rng.random(batch) >= 0.5)
+        within = rng.integers(0, np.maximum(extras, 1), size=batch)
+        return roots + internal * (within + 1)
+
     def sample_ids(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
-        ids = rng.integers(self.lo, self.rows, size=batch)
+        groups = len(self.soff)
+        ids = self._sample_groups(batch, rng)
         k = int(batch * recent_mix)
         if k > 0:
-            span = max(1, int((self.rows - self.lo) * recent_frac))
-            ids[:k] = rng.integers(self.rows - span, self.rows, size=k)
+            span = max(1, int(groups * recent_frac))
+            ids[:k] = self._sample_groups(k, rng, groups - span)
         return ids
 
     def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         return self.gather(self.sample_ids(batch, rng, recent_mix, recent_frac))
 
     def sample_old(self, batch, rng, recent_frac=0.2):
-        span = max(1, int((self.rows - self.lo) * recent_frac))
-        hi = max(self.lo + 1, self.rows - span)
-        return self.gather(rng.integers(self.lo, hi, size=batch))
+        groups = len(self.soff)
+        span = max(1, int(groups * recent_frac))
+        hi = max(1, groups - span)
+        return self.gather(self._sample_groups(batch, rng, hi=hi))
 
     def replay_stats(self):
         ids = np.arange(self.lo, self.rows, dtype=np.int64) % self.cap
@@ -711,6 +722,7 @@ def main():
         "sog_solves": 0,
         "optimizer_rows": 0,
         "generated_rows": 0,
+        "generated_solves": 0,
         "next_target": None,
         "lr_duration": None,
         "farm_runs": 0,
@@ -810,6 +822,7 @@ def main():
         progress["farm_runs"] += 1
         optimizer_rows = int(progress["optimizer_rows"])
         generated_rows = int(progress["generated_rows"])
+        generated_solves = int(progress["generated_solves"])
         window = collections.Counter()
         totals = collections.Counter(progress["totals"])
         window_shapes = []
@@ -826,6 +839,7 @@ def main():
                 "sog_solves": sog_solves,
                 "optimizer_rows": optimizer_rows,
                 "generated_rows": generated_rows,
+                "generated_solves": generated_solves,
                 "next_target": next_target - t0,
                 "totals": dict(totals),
             })
@@ -849,6 +863,7 @@ def main():
             solves = int(data["solves"])
             sog_solves += solves
             generated_rows += n
+            generated_solves += solves
             window["results"] += 1
             window["rows"] += n
             window["solves"] += solves
@@ -868,7 +883,7 @@ def main():
                 amount = int(data.get(name, 0))
                 totals[name] += amount
                 window[name] += amount
-            debt = max(0.0, args.replay_ratio * generated_rows - optimizer_rows)
+            debt = max(0.0, args.replay_ratio * generated_solves - optimizer_rows)
             nsteps = int(debt // args.batch) if len(buf) >= args.batch else 0
             lv, train_s, train_stat = fit(nsteps, deadline)
             trained = train_stat.get("steps", 0)
@@ -1001,7 +1016,7 @@ def main():
                 "optimizer_steps": optimizer_rows // args.batch,
                 "optimizer_rows": optimizer_rows,
                 "optimizer_debt": round(
-                    max(0.0, args.replay_ratio * generated_rows - optimizer_rows), 1),
+                    max(0.0, args.replay_ratio * generated_solves - optimizer_rows), 1),
                 "replay_rows": generated_rows,
                 "rows_per_s": round(
                     generated_rows / max(sog_elapsed, 1e-9), 1),

@@ -8,7 +8,7 @@ use warchest::contract::{Call, Reply};
 use warchest::net::Net;
 use warchest::pbs::{expand_row, pack_row, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
-use warchest::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
+use warchest::search::{Budget, Cfg, Cfr, Solved, Solver, Step, NO_TRANS};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 
 struct Backend(TestDevice);
@@ -77,7 +77,8 @@ fn shift_call(call: &Call, base: usize) -> Call {
         | Call::Configs { solve, .. }
         | Call::Tree { solve, .. }
         | Call::Iterate { solve, .. }
-        | Call::Read { solve, .. } => *solve += base,
+        | Call::Read { solve, .. }
+        | Call::Harvest { solve, .. } => *solve += base,
     }
     shifted
 }
@@ -261,6 +262,7 @@ fn a_solve_may_change_pipeline_streams() {
                 let got = got.expect("a finished solve");
                 assert_eq!(want.policy.off, got.policy.off);
                 assert_eq!(want.policy.act, got.policy.act);
+                assert_eq!(want.internal.len(), got.internal.len());
                 let bad = worst(&want.policy.p, &got.policy.p, "root policy");
                 assert!(bad < 1e-6, "the policy changed across streams by {bad:e}");
                 break;
@@ -418,6 +420,130 @@ fn a_ragged_round_does_not_move_the_small_solve() {
     assert!(p < 0.25, "a ragged round moved the small solve's policy by {p:e}");
 }
 
+
+fn host_final(sv: &Solver, resident: &warchest::cuda::Resident) -> (Vec<f32>, Vec<f32>) {
+    let mut reach = vec![0.0; sv.nreach];
+    for p in 0..2 {
+        let root = &sv.nodes[0];
+        let at = root.roff as usize + if p == 1 { root.nc[0] as usize } else { 0 };
+        reach[at..at + root.nc[p] as usize].copy_from_slice(&sv.root_belief[p].p);
+    }
+    for i in 1..sv.nodes.len() {
+        let child = &sv.nodes[i];
+        let parent = &sv.nodes[child.parent as usize];
+        for p in 0..2 {
+            let src = parent.roff as usize + if p == 1 { parent.nc[0] as usize } else { 0 };
+            let dst = child.roff as usize + if p == 1 { child.nc[0] as usize } else { 0 };
+            let prior = reach[src..src + parent.nc[p] as usize].to_vec();
+            if p != parent.player as usize {
+                reach[dst..dst + prior.len()].copy_from_slice(&prior);
+            } else if parent.chance {
+                for (c, mass) in prior.into_iter().enumerate() {
+                    let (to, probability) = parent.draw.row(c);
+                    for (&to, &probability) in to.iter().zip(probability) {
+                        reach[dst + to as usize] += mass * probability;
+                    }
+                }
+            } else {
+                for (c, mass) in prior.into_iter().enumerate() {
+                    for cell in parent.legal_row(c) {
+                        if parent.legal_child[cell] as usize != i || parent.legal_trans[cell] == NO_TRANS {
+                            continue;
+                        }
+                        reach[dst + parent.legal_trans[cell] as usize] +=
+                            mass * resident.sum[parent.soff as usize + cell];
+                    }
+                }
+            }
+        }
+    }
+
+    let mut value = vec![0.0; 2 * sv.nvals];
+    for node in sv.nodes.iter().rev() {
+        for p in 0..2 {
+            let at = p * sv.nvals + node.voff as usize;
+            let n = node.nc[p] as usize;
+            if node.leaf {
+                if node.state.is_terminal() {
+                    let other = node.roff as usize + if p == 0 { node.nc[0] as usize } else { 0 };
+                    let mass = reach[other..other + node.nc[1 - p] as usize].iter().sum::<f32>();
+                    value[at..at + n].fill(node.state.utility(p) * mass);
+                } else {
+                    value[at..at + n].copy_from_slice(&resident.values[at..at + n]);
+                }
+            } else if node.chance {
+                let child = &sv.nodes[node.child[0]];
+                if p == node.player as usize {
+                    for c in 0..n {
+                        let (to, probability) = node.draw.row(c);
+                        value[at + c] = to.iter().zip(probability).map(|(&to, &probability)| {
+                            probability * value[p * sv.nvals + child.voff as usize + to as usize]
+                        }).sum();
+                    }
+                } else {
+                    let from = p * sv.nvals + child.voff as usize;
+                    value.copy_within(from..from + n, at);
+                }
+            } else if p != node.player as usize {
+                for c in 0..n {
+                    value[at + c] = node.child.iter().map(|&child| {
+                        value[p * sv.nvals + sv.nodes[child].voff as usize + c]
+                    }).sum();
+                }
+            } else {
+                for c in 0..n {
+                    value[at + c] = node.legal_row(c).map(|cell| {
+                        let to = node.legal_trans[cell];
+                        if to == NO_TRANS {
+                            0.0
+                        } else {
+                            resident.sum[node.soff as usize + cell]
+                                * value[p * sv.nvals + sv.nodes[node.legal_child[cell] as usize].voff as usize + to as usize]
+                        }
+                    }).sum();
+                }
+            }
+        }
+    }
+    (reach, value)
+}
+
+#[test]
+fn harvested_rows_match_an_independent_final_policy_evaluation() {
+    let net = Arc::new(Net::random(0x9E37));
+    let device = Backend(gpu(26));
+    let mut data = Data::default();
+    let sv = GameStream::new(0x51E5, game_cfg(512, 8.0)).next_solve(&net, &mut data);
+    let (sv, solved) = run_solve(&device, sv);
+    let solved = solved.expect("collected solve");
+    let row = solved.internal.first().expect("the fixed solve has a harvest candidate");
+    let resident = device.0.resident(0, 0).expect("resident solve");
+    let (reach, value) = host_final(&sv, &resident);
+    let node = sv.nodes.iter().enumerate().find_map(|(i, n)| {
+        if n.state != row.state || n.cfgs[0].as_ref() != row.belief[0].cfg || n.cfgs[1].as_ref() != row.belief[1].cfg {
+            return None;
+        }
+        let matches = (0..2).all(|p| {
+            let at = n.roff as usize + if p == 1 { n.nc[0] as usize } else { 0 };
+            let got = &reach[at..at + n.nc[p] as usize];
+            let mass = got.iter().sum::<f32>();
+            got.iter().zip(&row.belief[p].p).all(|(&a, &b)| (a / mass - b).abs() < 2e-4)
+        });
+        matches.then_some(i)
+    }).expect("host reach identifies the harvested node");
+    let n = &sv.nodes[node];
+    let masses: [f32; 2] = std::array::from_fn(|p| {
+        let at = n.roff as usize + if p == 1 { n.nc[0] as usize } else { 0 };
+        reach[at..at + n.nc[p] as usize].iter().sum::<f32>()
+    });
+    assert!(masses.iter().all(|&mass| mass > 1e-6));
+    for p in 0..2 {
+        let at = p * sv.nvals + n.voff as usize;
+        let expected: Vec<f32> = value[at..at + n.nc[p] as usize]
+            .iter().map(|v| v / masses[1 - p]).collect();
+        assert!(worst(&expected, &row.value[p], "host-evaluated harvested values") < 2.0 * TF32);
+    }
+}
 
 #[test]
 fn a_one_update_average_is_the_initial_strategy() {

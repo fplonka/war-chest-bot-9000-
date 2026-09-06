@@ -18,7 +18,7 @@ use crate::net::{
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
-    CFEAT, HEX_BLOCK, HEX_CH, HEX_FACTS, LOOSE, MAX_COINS, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
+    CFEAT, HEX_BLOCK, HEX_CH, HEX_FACTS, LOOSE, MAX_COINS, MAX_CONFIG_SUPPORT, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
     OFF_PILES, PILE_COUNTS, PLAYER_SCALARS, PUBFEAT, ROW_BAG_SIZE, ROW_BYTES, ROW_FD_SIZE,
     ROW_HAND_SIZE, ROW_HEX_HEIGHT, ROW_HEX_MARKER, ROW_HEX_OWNER, ROW_HEX_SLOT, ROW_IDS,
     ROW_INITIATIVE, ROW_INIT_MOVED, ROW_PILES, ROW_STACK_KIND, ROW_STACK_OWED, ROW_WP,
@@ -75,6 +75,7 @@ kernels! {
     bag,
     leaf,
     leaf_scale,
+    reach_mass,
     reach_sweep,
     backprop_sweep,
 }
@@ -651,6 +652,7 @@ impl Device {
             qval: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_QVAL, 0, s.ncells, &mut h)?,
             visits: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_VISITS, 0, s.ncells, &mut h)?,
             reach: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_REACH, 0, s.nreach, &mut h)?,
+            values: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_VALS, 0, 2 * s.nvals, &mut h)?,
         })
     }
 }
@@ -667,6 +669,7 @@ pub struct Resident {
     pub qval: Vec<f32>,
     pub visits: Vec<f32>,
     pub reach: Vec<f32>,
+    pub values: Vec<f32>,
 }
 
 struct Gpu {
@@ -970,6 +973,7 @@ impl Card {
             self.iterate(calls, same, &mut out).map_err(at("iterate"))?;
         }
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
+        self.harvest(calls, &pick(5), &mut out).map_err(at("harvest"))?;
         {
             let solves = self.solves.lock();
             for &slot in &slots {
@@ -1830,6 +1834,40 @@ impl Card {
             self.value_pass(&self.batch.lock())?;
         }
 
+        let mut candidate_at = vec![0usize; calls.len()];
+        let mut candidate_len = vec![0usize; calls.len()];
+        let mut parts = Vec::new();
+        let mut nodes = Vec::new();
+        for (part, &i) in mine.iter().filter(|&&i| matches!(&calls[i], Call::Read { vals_at, .. } if vals_at[0].1 > 0 || vals_at[1].1 > 0)).enumerate() {
+            let Call::Read { candidates, .. } = &calls[i] else { unreachable!() };
+            candidate_at[i] = 2 * nodes.len();
+            candidate_len[i] = 2 * candidates.len();
+            parts.extend(std::iter::repeat_n(part as i32, candidates.len()));
+            nodes.extend(candidates.iter().map(|&node| node as i32));
+        }
+        let masses = if nodes.is_empty() {
+            Vec::new()
+        } else {
+            let mut b = self.batch.lock();
+            b.part.put(&self.stream, parts.len(), copy(&parts))?;
+            b.local.put(&self.stream, nodes.len(), copy(&nodes))?;
+            let mut scratch = self.scratch.lock();
+            let dst = scratch.queries.room(2 * nodes.len())?;
+            let count = nodes.len() as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.reach_mass)
+                    .arg(b.trees.buf()).arg(b.part.buf()).arg(b.local.buf()).arg(&mut *dst).arg(&count)
+                    .launch_unit(LaunchConfig {
+                        grid_dim: (nodes.len() as u32, 1, 1),
+                        block_dim: (32, 2, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(err)?;
+            self.down_f.lock().recv(&self.stream, &dst.slice(..2 * nodes.len()))?
+        };
+
         let g = self.solves.lock();
         let mut h = self.down_f.lock();
         for &i in mine {
@@ -1848,7 +1886,58 @@ impl Card {
                 policy_at.1 as usize,
                 &mut h,
             )?;
-            out.push((i, Reply { a: root, b: policy, ..Default::default() }));
+            let at = candidate_at[i];
+            let c = masses[at..at + candidate_len[i]].to_vec();
+            out.push((i, Reply { a: root, b: policy, c, ..Default::default() }));
+        }
+        Ok(())
+    }
+
+    fn harvest(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
+        if mine.is_empty() {
+            return Ok(());
+        }
+        let solves: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
+        self.lay(&solves)?;
+        let mut at = vec![0usize; calls.len()];
+        let mut len = vec![0usize; calls.len()];
+        let total = mine.iter().map(|&i| match &calls[i] {
+            Call::Harvest { rows, .. } => rows.iter().map(|row| {
+                row.values.iter().map(|&(_, n)| n as usize).sum::<usize>()
+                    + row.reach.1 as usize
+                    + row.policy.1 as usize
+            }).sum::<usize>(),
+            _ => unreachable!("harvest shard holds only harvest calls"),
+        }).sum();
+        let mut scratch = self.scratch.lock();
+        let dst = scratch.queries.room(total)?;
+        let g = self.solves.lock();
+        let mut offset = 0;
+        for &i in mine {
+            let Call::Harvest { solve, rows } = &calls[i] else {
+                unreachable!("harvest shard holds only harvest calls")
+            };
+            at[i] = offset;
+            let s = &g[*solve];
+            for row in rows {
+                for &(from, n) in &row.values {
+                    s.ent[Ent::Reach as usize].copy_f32_to(
+                        &self.stream, R_VALS, from as usize, dst, offset, n as usize)?;
+                    offset += n as usize;
+                }
+                s.ent[Ent::Reach as usize].copy_f32_to(
+                    &self.stream, R_REACH, row.reach.0 as usize, dst, offset, row.reach.1 as usize)?;
+                offset += row.reach.1 as usize;
+                s.ent[Ent::Cell as usize].copy_f32_to(
+                    &self.stream, C_SUM, row.policy.0 as usize, dst, offset, row.policy.1 as usize)?;
+                offset += row.policy.1 as usize;
+            }
+            len[i] = offset - at[i];
+        }
+        drop(g);
+        let host = self.down_f.lock().recv(&self.stream, &dst.slice(..total))?;
+        for &i in mine {
+            out.push((i, Reply { a: host[at[i]..at[i] + len[i]].to_vec(), ..Default::default() }));
         }
         Ok(())
     }
@@ -2103,7 +2192,7 @@ impl Plan {
             z: self.arr(TILE * D)?,
             input: self.arr(TILE * (2 * C + LOOSE))?,
             leaves: self.arr(n * cfg.s.max(1) as usize)?,
-            queries: self.arr(n * b.cap(Ent::Config))?,
+            queries: self.arr(n * (2 * nodes + b.cap(Ent::Cell) + 16 * MAX_CONFIG_SUPPORT))?,
             piles: self.arr(TILE * NTYPE * PILE_COUNTS)?,
             tokens: self.arr(TILE * NTYPE * TYPE)?,
             projected: self.arr(TILE * NTYPE * C)?,

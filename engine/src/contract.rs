@@ -52,7 +52,19 @@ pub enum Call {
         touched: [bool; 2],
         vals_at: [(u32, u32); 2],
         policy_at: (u32, u32),
+        candidates: Vec<u32>,
     },
+    Harvest {
+        solve: usize,
+        rows: Vec<ReadRow>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub struct ReadRow {
+    pub values: [(u32, u32); 2],
+    pub reach: (u32, u32),
+    pub policy: (u32, u32),
 }
 
 #[derive(Clone, Copy)]
@@ -156,6 +168,7 @@ impl Call {
             Call::Tree { .. } => 2,
             Call::Iterate { .. } => 3,
             Call::Read { .. } => 4,
+            Call::Harvest { .. } => 5,
         }
     }
 
@@ -165,7 +178,8 @@ impl Call {
             | Call::Configs { solve, .. }
             | Call::Tree { solve, .. }
             | Call::Iterate { solve, .. }
-            | Call::Read { solve, .. } => *solve,
+            | Call::Read { solve, .. }
+            | Call::Harvest { solve, .. } => *solve,
         }
     }
 
@@ -173,7 +187,7 @@ impl Call {
         match self {
             Call::Trunk { queries, .. } => *queries,
             Call::Configs { n, .. } => *n,
-            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => 0,
+            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } | Call::Harvest { .. } => 0,
         }
     }
 }

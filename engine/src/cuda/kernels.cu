@@ -1189,6 +1189,20 @@ __global__ void k_terminals(const Tree* trees) {
     for (unsigned int c = threadIdx.x; c < m; c += 32) vals[vo + c] = u * acc;
 }
 
+__global__ void k_reach_mass(const Tree* trees, const int* part,
+                             const int* nodes, float* out, int n) {
+    int row = blockIdx.x, player = threadIdx.y;
+    if (row >= n) return;
+    const Tree& t = trees[part[row]];
+    unsigned int node = nodes[row];
+    unsigned int count = t.nc[2 * node + player];
+    unsigned int at = rbase(t, node, player);
+    float mass = 0.0f;
+    for (unsigned int c = threadIdx.x; c < count; c += 32) mass += t.reach[at + c];
+    mass = warp_sum(mass);
+    if (threadIdx.x == 0) out[2 * row + player] = mass;
+}
+
 __global__ void k_finish(const Tree* trees, const unsigned int* work, int at,
                          int level, const int* touched) {
     unsigned int item = work[at + blockIdx.x];

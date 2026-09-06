@@ -4,7 +4,7 @@ use crate::net::Net;
 use crate::pbs::*;
 use crate::policy;
 use crate::rng::Rng;
-use crate::search::{Cfg, Solved, Solver};
+use crate::search::{Cfg, Solved, SolvedRow, Solver};
 use crate::state::{Cont, State, BLACK, WHITE};
 #[cfg(feature = "python")]
 use rayon::prelude::*;
@@ -169,6 +169,13 @@ impl Data {
         self.nv += 1;
     }
 
+    fn push_internal(&mut self, ctx: &Ctx, rows: &[SolvedRow]) {
+        for row in rows {
+            let value = [&row.value[0][..], &row.value[1][..]];
+            self.push_value(&row.state, ctx, &row.belief, value, [u32::MAX; 2], &row.policy);
+        }
+    }
+
     #[inline]
     pub fn row_span(&self, r: usize, p: usize) -> std::ops::Range<usize> {
         self.coff[2 * r + p] as usize..self.coff[2 * r + p + 1] as usize
@@ -239,10 +246,12 @@ pub fn keep_query(sv: &Solver, solved: Option<Solved>, out: &mut Data) -> Vec<(S
         &sv.root_belief,
         [&solved.value[0], &solved.value[1]],
         [u32::MAX; 2],
-        &Default::default(),
+        &solved.policy,
     );
-    *out.query.last_mut().expect("query row") = 1;
-    out.queries += 1;
+    out.push_internal(&sv.ctx, &solved.internal);
+    let n = out.nv - solved.internal.len() - 1;
+    out.query[n..].fill(1);
+    out.queries += solved.internal.len() + 1;
     solved.queries
 }
 
@@ -308,7 +317,7 @@ impl Game {
                     if self.gc.collect == Collect::Static && matches!(self.s.pending(), Cont::MainPlay) {
                         let y0 = vec![policy::eval_squashed(&self.s, 0); self.bel[0].cfg.len()];
                         let y1 = vec![policy::eval_squashed(&self.s, 1); self.bel[1].cfg.len()];
-                        self.record([&y0, &y1], &np.to_replay(player, &self.ctx));
+                        self.record([&y0, &y1], &np.to_replay(player, &self.ctx), &[]);
                     }
                     self.play(np);
                 }
@@ -332,13 +341,13 @@ impl Game {
 
     pub fn play_solved(&mut self, sv: &Solver, solved: Option<Solved>) {
         if let Some(solved) = solved {
-            self.record([&solved.value[0], &solved.value[1]], &solved.policy);
+            self.record([&solved.value[0], &solved.value[1]], &solved.policy, &solved.internal);
             self.queries.extend(solved.queries);
         }
         self.play(policy::root(sv));
     }
 
-    fn record(&mut self, value: [&[f32]; 2], policy: &crate::search::Policy) {
+    fn record(&mut self, value: [&[f32]; 2], policy: &crate::search::Policy, internal: &[SolvedRow]) {
         let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
         self.last_value = std::array::from_fn(|p| value[p][truth[p] as usize]);
         let outcome_needed = self.label.unit_f64() < self.gc.p_td1 as f64;
@@ -348,6 +357,7 @@ impl Game {
         if outcome_needed {
             *data.td1.last_mut().expect("the row just pushed") = 1;
         }
+        data.push_internal(&self.ctx, internal);
     }
 
     fn true_index(&self, p: usize) -> usize {
@@ -381,6 +391,9 @@ impl Game {
             (self.last_value, [f32::NAN; 2])
         };
         for r in 0..self.pending.nv {
+            if self.pending.td1[r] == 0 {
+                continue;
+            }
             for p in 0..2 {
                 self.pending.outcome[2 * r + p] = outcome[p];
                 let at = self.pending.row_span(r, p).start + self.pending.truth[2 * r + p] as usize;

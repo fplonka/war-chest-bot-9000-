@@ -1,6 +1,6 @@
 use crate::actions::Action;
 use crate::board::NONE;
-use crate::contract::{Call, Dst, Prime, QueryPick, Reply, Writes};
+use crate::contract::{Call, Dst, Prime, QueryPick, ReadRow, Reply, Writes};
 use crate::net::Net;
 use crate::pbs::*;
 use crate::rng::Rng;
@@ -268,6 +268,7 @@ pub struct TNode {
     pub voff: u32,
     pub soff: u32,
     pub row_of: u32,
+    pub expanded_at: u32,
     pub util: f32,
     pub player: u8,
     pub leaf: bool,
@@ -320,6 +321,14 @@ struct Mark {
 pub struct Solved {
     pub value: [Vec<f32>; 2],
     pub queries: Vec<(State, [Belief; 2])>,
+    pub policy: Policy,
+    pub internal: Vec<SolvedRow>,
+}
+
+pub struct SolvedRow {
+    pub state: State,
+    pub belief: [Belief; 2],
+    pub value: [Vec<f32>; 2],
     pub policy: Policy,
 }
 
@@ -463,6 +472,7 @@ enum Phase {
     Fresh,
     Iterating,
     Reading,
+    Harvesting,
     Done,
 }
 
@@ -484,6 +494,8 @@ pub struct Solver {
     queries: Vec<(State, [Belief; 2])>,
     query_seen: usize,
     query_nodes: Vec<usize>,
+    harvest_nodes: Vec<usize>,
+    solved: Option<Solved>,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
     resealed: Vec<u32>,
@@ -678,6 +690,7 @@ impl Solver {
             voff: self.nvals as u32,
             soff: self.counts.cells as u32,
             row_of: u32::MAX,
+            expanded_at: u32::MAX,
             util: if terminal { s.utility(player as usize) } else { 0.0 },
             player,
             leaf: true,
@@ -737,6 +750,7 @@ impl Solver {
             "growth turns an expandable leaf into a decision node, and nothing else"
         );
         let fresh = self.nodes.len();
+        self.nodes[id].expanded_at = self.steps[0] as u32;
         self.grow(id);
         if self.abandon {
             self.abandon = false;
@@ -1270,12 +1284,29 @@ impl Solver {
             }
             Phase::Reading => {
                 self.absorb();
-                self.phase = Phase::Done;
                 let [.., iterated, read] = replies else {
                     unreachable!("the final round answers its regret updates and its read")
                 };
                 self.absorb_queries(&iterated.c);
-                return Step::Done(self.read_back(read));
+                let Some(solved) = self.read_root(read) else {
+                    self.phase = Phase::Done;
+                    return Step::Done(None);
+                };
+                self.solved = Some(solved);
+                if self.harvest_nodes.is_empty() {
+                    self.phase = Phase::Done;
+                    return Step::Done(self.solved.take());
+                }
+                self.phase = Phase::Harvesting;
+                return Step::Calls(vec![self.harvest_call()]);
+            }
+            Phase::Harvesting => {
+                let [read] = replies else {
+                    unreachable!("the harvest read has one reply")
+                };
+                self.read_harvest(read);
+                self.phase = Phase::Done;
+                return Step::Done(self.solved.take());
             }
             Phase::Done => unreachable!("a finished solve is not advanced again"),
         }
@@ -1335,7 +1366,8 @@ impl Solver {
         calls
     }
 
-    fn read_call(&self) -> Call {
+    fn read_call(&mut self) -> Call {
+        self.harvest_nodes = self.collect.map(|_| self.harvest_candidates()).unwrap_or_default();
         let nvals = self.nvals as u32;
         let vals_at = match self.collect {
             None => [(0, 0); 2],
@@ -1347,19 +1379,95 @@ impl Solver {
             touched: self.avg_touched,
             vals_at,
             policy_at: (at as u32, cells as u32),
+            candidates: self.harvest_nodes.iter().map(|&i| i as u32).collect(),
         }
     }
 
-    fn read_back(&mut self, r: &Reply) -> Option<Solved> {
+    fn harvest_candidates(&self) -> Vec<usize> {
+        let mut subtree = vec![0u32; self.nodes.len()];
+        for i in (0..self.nodes.len()).rev() {
+            let n = &self.nodes[i];
+            subtree[i] += (!n.leaf && !n.chance) as u32;
+            if n.parent != crate::contract::NO_ROW {
+                subtree[n.parent as usize] += subtree[i];
+            }
+        }
+        self.nodes
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(i, n)| {
+                !n.leaf
+                    && !n.chance
+                    && n.state.is_valued()
+                    && self.steps[0].saturating_sub(n.expanded_at as usize) >= 16
+                    && subtree[*i] >= 8
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn read_root(&mut self, r: &Reply) -> Option<Solved> {
         let (at, cells) = self.root_cells();
         self.avg = vec![0.0; at + cells];
         self.avg[at..at + cells].copy_from_slice(&r.b);
         self.collect?;
+        let eligible: Vec<usize> = std::mem::take(&mut self.harvest_nodes)
+            .into_iter()
+            .zip(r.c.chunks_exact(2))
+            .filter_map(|(node, mass)| (mass[0] > 1e-6 && mass[1] > 1e-6).then_some(node))
+            .collect();
+        let chosen = sample_indices(&mut self.rng, eligible.len(), eligible.len().min(4));
+        self.harvest_nodes = chosen.into_iter().map(|i| eligible[i]).collect();
         let n0 = self.nodes[0].nc[0] as usize;
         let value = [r.a[..n0].to_vec(), r.a[n0..].to_vec()];
         let policy = self.root_policy();
         let queries = std::mem::take(&mut self.queries);
-        Some(Solved { value, queries, policy })
+        Some(Solved { value, queries, policy, internal: Vec::new() })
+    }
+
+    fn harvest_call(&self) -> Call {
+        let rows = self.harvest_nodes.iter().map(|&i| {
+            let n = &self.nodes[i];
+            ReadRow {
+                values: [(n.voff, n.nc[0]), (self.nvals as u32 + n.voff, n.nc[1])],
+                reach: (n.roff, n.nc[0] + n.nc[1]),
+                policy: (n.soff, n.legal_action.len() as u32),
+            }
+        });
+        Call::Harvest { solve: self.slot, rows: rows.collect() }
+    }
+
+    fn read_harvest(&mut self, r: &Reply) {
+        let mut at = 0;
+        let mut rows = Vec::with_capacity(self.harvest_nodes.len());
+        for &node in &self.harvest_nodes {
+            let n = &self.nodes[node];
+            let count = [n.nc[0] as usize, n.nc[1] as usize];
+            let value: [Vec<f32>; 2] = std::array::from_fn(|p| {
+                let out = r.a[at..at + count[p]].to_vec();
+                at += count[p];
+                out
+            });
+            let reach: [&[f32]; 2] = std::array::from_fn(|p| {
+                let out = &r.a[at..at + count[p]];
+                at += count[p];
+                out
+            });
+            let mass = reach.each_ref().map(|w| w.iter().sum::<f32>());
+            let belief = std::array::from_fn(|p| {
+                let mut weights = vec![0.0; count[p]];
+                normalize_weights(reach[p], &mut weights);
+                Belief { cfg: n.cfgs[p].to_vec(), p: weights }
+            });
+            let cells = n.legal_action.len();
+            let policy = self.node_policy(node, &r.a[at..at + cells]);
+            at += cells;
+            let value = std::array::from_fn(|p| value[p].iter().map(|v| v / mass[1 - p]).collect());
+            rows.push(SolvedRow { state: n.state, belief, value, policy });
+        }
+        assert_eq!(at, r.a.len(), "harvest reply has a trailing tail");
+        self.solved.as_mut().expect("root read precedes harvest").internal = rows;
     }
 
     fn root_cells(&self) -> (usize, usize) {
@@ -1456,8 +1564,16 @@ impl Solver {
     }
 
     pub fn root_policy(&self) -> Policy {
-        let n = &self.nodes[0];
-        if n.leaf || n.chance || self.avg.is_empty() {
+        let (at, cells) = self.root_cells();
+        if self.avg.is_empty() {
+            return Policy::default();
+        }
+        self.node_policy(0, &self.avg[at..at + cells])
+    }
+
+    fn node_policy(&self, node: usize, probabilities: &[f32]) -> Policy {
+        let n = &self.nodes[node];
+        if n.leaf || n.chance {
             return Policy::default();
         }
         let me = n.player as usize;
@@ -1467,12 +1583,11 @@ impl Solver {
                 .collect(),
             ..Default::default()
         };
-        let so = self.nodes[0].soff as usize;
         out.off.push(0);
         for c in 0..n.nc[me] as usize {
             for cell in n.legal_row(c) {
                 out.act.push(n.legal_action[cell] as u16);
-                out.p.push(self.avg[so + cell]);
+                out.p.push(probabilities[cell]);
             }
             out.off.push(out.act.len() as u32);
         }

@@ -117,6 +117,19 @@ def main():
     assert probe.cw.dtype == np.float32
     assert probe.cw[0] == tiny
 
+    grouped = train.Buffer(5, 32)
+    first = list(chunk(train, 0, 5))
+    first[5] = np.asarray([0, 3, 5], np.int64)
+    grouped.add(*first)
+    second = list(chunk(train, 5, 3))
+    second[5] = np.asarray([0, 3], np.int64)
+    grouped.add(*second)
+    assert grouped.lo == 3
+    np.testing.assert_array_equal(grouped.soff, [5, 8])
+    sampled = grouped.sample_ids(20_000, np.random.default_rng(11))
+    assert set(sampled) == {3, 4, 5, 6, 7}
+    assert 0.47 < np.mean(np.isin(sampled, [3, 5])) < 0.53
+
     buf = train.Buffer(4096, 12_000)
     for start in range(0, 6000, 1000):
         buf.add(*chunk(train, start, 1000))
