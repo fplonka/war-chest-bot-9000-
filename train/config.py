@@ -27,7 +27,6 @@ class Cfg:
     c: float = 8.0
     round_batch: int = 8
     rounds: int = 0
-    p_td1: float = 0.2
     query_rate: float = 0.9
     recursive_rate: float = 0.1
     cfr: str = "sog"

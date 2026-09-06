@@ -327,7 +327,7 @@ impl Farm {
             for d in self.collected.lock().drain(..) {
                 out.merge(d);
             }
-            if out.soff.len() >= solves {
+            if out.completed >= solves {
                 return out;
             }
             if self.stopping.load(Ordering::Relaxed) || self.broken.load(Ordering::Relaxed) {

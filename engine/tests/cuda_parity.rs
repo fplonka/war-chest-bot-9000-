@@ -33,7 +33,6 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
         collect: Collect::Sog,
         explore: 0.1,
         random_draft: true,
-        p_td1: 0.0,
         query_rate: 0.0,
         recursive_rate: 0.0,
     }

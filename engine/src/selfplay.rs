@@ -4,7 +4,7 @@ use crate::net::Net;
 use crate::pbs::*;
 use crate::policy;
 use crate::rng::Rng;
-use crate::search::{Cfg, Solved, Solver};
+use crate::search::{Budget, Cfg, Solved, Solver};
 use crate::state::{Cont, State, BLACK, WHITE};
 #[cfg(feature = "python")]
 use rayon::prelude::*;
@@ -61,7 +61,7 @@ pub struct Data {
     pub created: Vec<f64>,
     solve_created: f64,
     pub query: Vec<u8>,
-    pub td1: Vec<u8>,
+    pub terminal: Option<Box<Data>>,
     pub plays: [usize; N_PLAYS],
 
     pub coff: Vec<u32>,
@@ -75,6 +75,7 @@ pub struct Data {
     pub configs: usize,
     pub queries: usize,
     pub dropped: usize,
+    pub completed: usize,
 }
 
 impl Data {
@@ -89,7 +90,10 @@ impl Data {
         macro_rules! append {
             ($($name:ident),* $(,)?) => { $( self.$name.extend(o.$name); )* };
         }
-        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query, td1);
+        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query);
+        if let Some(t) = o.terminal {
+            self.terminal.get_or_insert_with(Default::default).merge(*t);
+        }
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
@@ -107,6 +111,7 @@ impl Data {
         self.configs += o.configs;
         self.queries += o.queries;
         self.dropped += o.dropped;
+        self.completed += o.completed;
     }
 
     pub fn begin_solve(&mut self) {
@@ -165,14 +170,9 @@ impl Data {
         self.outcome.extend([f32::NAN; 2]);
         self.created.push(self.solve_created);
         self.query.push(0);
-        self.td1.push(0);
         self.nv += 1;
     }
 
-    #[inline]
-    pub fn row_span(&self, r: usize, p: usize) -> std::ops::Range<usize> {
-        self.coff[2 * r + p] as usize..self.coff[2 * r + p + 1] as usize
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -181,23 +181,25 @@ pub struct GameCfg {
     pub collect: Collect,
     pub explore: f32,
     pub random_draft: bool,
-    pub p_td1: f32,
     pub query_rate: f32,
     pub recursive_rate: f32,
 }
 
+const CHEAP_S: u32 = 32;
+const TEACH_RATE: f64 = 0.1;
+
 pub struct Game {
     rng: Rng,
+    budget: Rng,
     s: State,
     ctx: Ctx,
     bel: [Belief; 2],
-    label: Rng,
     ready: Data,
     pending: Data,
     gc: GameCfg,
     queries: Vec<(State, [Belief; 2])>,
     main_plays: u16,
-    last_value: [f32; 2],
+    teaches: bool,
 }
 
 fn draw_count(rng: &mut Rng, rate: f32) -> usize {
@@ -252,21 +254,21 @@ fn collects_rows(gc: &GameCfg, s: &State) -> bool {
 
 impl Game {
     pub fn new(mut rng: Rng, gc: &GameCfg) -> Game {
-        let label = Rng::new(rng.next_u64());
+        let budget = Rng::new(rng.next_u64());
         let s = make_game(&mut rng, gc.random_draft);
         let ctx = Ctx::new(&s);
         Game {
             rng,
+            budget,
             s,
             ctx,
             bel: [Belief::point(Config::default()), Belief::point(Config::default())],
-            label,
             ready: Data::default(),
             pending: Data::default(),
             gc: *gc,
             queries: Vec::new(),
             main_plays: 0,
-            last_value: [0.0; 2],
+            teaches: false,
         }
     }
 
@@ -312,7 +314,16 @@ impl Game {
                     }
                     self.play(np);
                 }
-                Agent::Sog { cfg } => {
+                Agent::Sog { mut cfg } => {
+                    let valued = collects_rows(&self.gc, &self.s);
+                    self.teaches = valued && self.budget.unit_f64() < TEACH_RATE;
+                    if valued {
+                        self.record_terminal();
+                    }
+                    if valued && !self.teaches {
+                        cfg.s = CHEAP_S;
+                        cfg.budget = Budget::for_s(CHEAP_S);
+                    }
                     let mut sv = Solver::new(
                         &self.s,
                         self.ctx,
@@ -321,7 +332,7 @@ impl Game {
                         self.bel.clone(),
                         Rng::new(self.rng.next_u64()),
                     );
-                    if collects_rows(&self.gc, &self.s) {
+                    if self.teaches {
                         sv.collect(draw_count(&mut self.rng, self.gc.query_rate));
                     }
                     return Some(sv);
@@ -331,23 +342,30 @@ impl Game {
     }
 
     pub fn play_solved(&mut self, sv: &Solver, solved: Option<Solved>) {
-        if let Some(solved) = solved {
+        if let (true, Some(solved)) = (self.teaches, solved) {
             self.record([&solved.value[0], &solved.value[1]], &solved.policy);
             self.queries.extend(solved.queries);
         }
         self.play(policy::root(sv));
     }
 
+    fn record_terminal(&mut self) {
+        let zeros = vec![0.0; self.bel.iter().map(Belief::len).max().unwrap()];
+        self.pending.begin_solve();
+        self.pending.push_value(
+            &self.s,
+            &self.ctx,
+            &self.bel,
+            [zeros.as_slice(); 2],
+            [self.true_index(0) as u32, self.true_index(1) as u32],
+            &Default::default(),
+        );
+    }
+
     fn record(&mut self, value: [&[f32]; 2], policy: &crate::search::Policy) {
         let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
-        self.last_value = std::array::from_fn(|p| value[p][truth[p] as usize]);
-        let outcome_needed = self.label.unit_f64() < self.gc.p_td1 as f64;
-        let data = if outcome_needed { &mut self.pending } else { &mut self.ready };
-        data.begin_solve();
-        data.push_value(&self.s, &self.ctx, &self.bel, value, truth, policy);
-        if outcome_needed {
-            *data.td1.last_mut().expect("the row just pushed") = 1;
-        }
+        self.ready.begin_solve();
+        self.ready.push_value(&self.s, &self.ctx, &self.bel, value, truth, policy);
     }
 
     fn true_index(&self, p: usize) -> usize {
@@ -374,21 +392,12 @@ impl Game {
 
     pub fn finish(&mut self) {
         let ended = self.s.is_terminal();
-        let (z, outcome) = if ended {
-            let z = [self.s.utility(0), self.s.utility(1)];
-            (z, z)
-        } else {
-            (self.last_value, [f32::NAN; 2])
-        };
-        for r in 0..self.pending.nv {
-            for p in 0..2 {
-                self.pending.outcome[2 * r + p] = outcome[p];
-                let at = self.pending.row_span(r, p).start + self.pending.truth[2 * r + p] as usize;
-                self.pending.cy[at] = z[p];
-            }
+        let mut pending = std::mem::take(&mut self.pending);
+        if ended {
+            let outcome = [self.s.utility(0), self.s.utility(1)];
+            pending.outcome = outcome.repeat(pending.nv);
+            self.ready.terminal.get_or_insert_with(Default::default).merge(pending);
         }
-        let pending = std::mem::take(&mut self.pending);
-        self.ready.merge(pending);
         self.ready.games += 1;
         match self.s.winner() {
             Some(w) => self.ready.wins[w as usize] += 1,
@@ -462,6 +471,7 @@ impl GameStream {
     }
 
     pub fn keep(&mut self, sv: &Solver, solved: Option<Solved>, out: &mut Data) {
+        out.completed += 1;
         match self.kind {
             SolveKind::Play => {
                 self.game.play_solved(sv, solved);
@@ -553,7 +563,6 @@ pub(crate) fn collect_roots(count: usize, seed: u64) -> Vec<(State, [Belief; 2])
         collect: Collect::None,
         explore: 0.0,
         random_draft: false,
-        p_td1: 0.0,
         query_rate: 0.0,
         recursive_rate: 0.0,
     };
@@ -600,7 +609,6 @@ mod target_tests {
             collect: Collect::Sog,
             explore: 0.0,
             random_draft: true,
-            p_td1: 0.0,
             query_rate: 0.0,
             recursive_rate: 0.0,
         };
@@ -618,13 +626,68 @@ mod target_tests {
     }
 
     #[test]
+    fn returns_label_copies_of_naturally_ended_games_only() {
+        let gc = GameCfg {
+            agents: [Agent::Random; 2],
+            collect: Collect::None,
+            explore: 0.0,
+            random_draft: true,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        for winner in [None, Some(WHITE)] {
+            let mut game = Game::new(Rng::new(17), &gc);
+            resolve_fixture_chance(&mut game);
+            let values = [vec![0.25; game.bel[0].len()], vec![-0.5; game.bel[1].len()]];
+            game.record([&values[0], &values[1]], &Default::default());
+            game.record_terminal();
+            let targets = game.ready.cy.clone();
+            if let Some(w) = winner {
+                game.s.winner = w;
+            }
+            game.finish();
+            assert_eq!(game.ready.cy, targets);
+            let labels = game.ready.terminal.as_ref().map(|t| t.outcome.clone());
+            assert_eq!(labels, winner.map(|_| vec![1.0, -1.0]));
+        }
+    }
+
+    #[test]
+    fn valued_play_uses_cheap_search_nine_times_in_ten() {
+        let full = Cfg::default();
+        let gc = GameCfg {
+            agents: [Agent::Sog { cfg: full }; 2],
+            collect: Collect::Sog,
+            explore: 0.0,
+            random_draft: true,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        let net = Arc::new(Net::default());
+        let mut teachers = 0;
+        for seed in 0..1000 {
+            let mut game = Game::new(Rng::new(seed), &gc);
+            let solver = game.next_solve(&net).expect("a valued play");
+            assert_eq!(game.pending.nv, 1);
+            assert_eq!(game.ready.nv, 0);
+            if game.teaches {
+                teachers += 1;
+                assert_eq!(solver.cfg.s, full.s);
+            } else {
+                assert_eq!(solver.cfg.s, CHEAP_S);
+                assert_eq!(solver.cfg.budget, Budget::for_s(CHEAP_S));
+            }
+        }
+        assert!((70..=130).contains(&teachers), "full searches: {teachers}");
+    }
+
+    #[test]
     fn exploration_is_the_policy_the_belief_is_updated_with() {
         let gc = GameCfg {
             agents: [Agent::Random; 2],
             collect: Collect::None,
             explore: 1.0,
             random_draft: true,
-            p_td1: 0.0,
             query_rate: 0.0,
             recursive_rate: 0.0,
         };

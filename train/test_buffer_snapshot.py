@@ -70,8 +70,8 @@ def chunk(train, start, n):
     truth = np.zeros((n, 2), np.uint32)
     outcome = np.full((n, 2), np.nan, np.float32)
     outcome[ids % 5 == 0] = (0.25, -0.25)
+    truth[ids % 5 == 0] = (1, 2)
     created = (1000.0 + ids).astype(np.float64)
-    td1 = (ids % 7 == 0).astype(np.uint8)
 
     has_policy = ids % 3 != 0
     na_row = np.where(has_policy, 1 + ids % 3, 0)
@@ -94,7 +94,7 @@ def chunk(train, start, n):
     ])
     policy = (pa, paoff, pcoff, pci, pact, pprob)
     return (rows, cc, cw, cy, coff, boundaries, source, truth, outcome,
-            created, td1, policy)
+            created, policy)
 
 
 def assert_same(left, right):
@@ -137,8 +137,8 @@ def main():
     assert buf.span_seconds() == restored.span_seconds()
     np.testing.assert_array_equal(buf.soff, restored.soff)
 
-    left = buf.sample_calibration(128, np.random.default_rng(91))
-    right = restored.sample_calibration(128, np.random.default_rng(91))
+    left = buf.sample_truth(128, np.random.default_rng(91))
+    right = restored.sample_truth(128, np.random.default_rng(91))
     assert_same(left, right)
     for kwargs in ({}, {"recent_mix": 0.37, "recent_frac": 0.31}):
         left = buf.sample_ids(500, np.random.default_rng(73), **kwargs)
@@ -159,7 +159,7 @@ def main():
         "cy": np.array([np.nan], np.float32),
     }
     try:
-        train.ingest(train.Buffer(4, 16), bad)
+        train.ingest(train.Buffer(4, 16), train.Buffer(4, 16), bad)
     except SystemExit as exc:
         message = str(exc)
         assert "data['cw']=2" in message and "data['cy']=1" in message

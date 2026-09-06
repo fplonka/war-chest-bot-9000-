@@ -83,11 +83,10 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         ("outcomes", d.outcome.len(), 2 * d.nv),
         ("creation times", d.created.len(), d.nv),
         ("query labels", d.query.len(), d.nv),
-        ("TD(1) labels", d.td1.len(), d.nv),
     ] {
         assert_eq!(got, want, "{name} do not match the row count");
     }
-    let n_solves = d.soff.len();
+    let n_solves = d.completed;
     let mut soff = d.soff.clone();
     soff.push(d.nv as u32);
     assert_eq!(soff[0], 0, "solve offsets must start at row 0");
@@ -104,7 +103,10 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, coff = d.coff,
         pa = d.pa, paoff = d.paoff, pcoff = d.pcoff, pci = d.pci,
         pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome,
-        created = d.created, query = d.query, td1 = d.td1, soff = soff,
+        created = d.created, query = d.query, soff = soff,
+    }
+    if let Some(t) = d.terminal {
+        out.set_item("terminal", data_to_dict(py, *t)?)?;
     }
     out.set_item("row_bytes", crate::pbs::ROW_BYTES)?;
     out.set_item("solves", n_solves)?;
@@ -120,7 +122,7 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, explore=0.1, random_draft=true, cfr="sog", p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
+    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, explore=0.1, random_draft=true, cfr="sog", query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
@@ -132,7 +134,6 @@ impl SolveFarm {
         explore: f32,
         random_draft: bool,
         cfr: &str,
-        p_td1: f32,
         query_rate: f32,
         recursive_rate: f32,
         devices: Vec<usize>,
@@ -153,7 +154,6 @@ impl SolveFarm {
             collect: Collect::Sog,
             explore,
             random_draft,
-            p_td1,
             query_rate,
             recursive_rate,
         };
@@ -243,7 +243,6 @@ fn gen_data(
         collect: Collect::Static,
         explore,
         random_draft,
-        p_td1: 0.0,
         query_rate: 0.0,
         recursive_rate: 0.0,
     };
