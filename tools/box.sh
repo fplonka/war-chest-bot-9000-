@@ -74,13 +74,15 @@ follow)
         pull_pid=$!
         trap 'kill "$pull_pid" 2>/dev/null || true; wait "$pull_pid" 2>/dev/null || true' EXIT
     fi
-    status=0
-    run_remote "while [ ! -s /workspace/logs/$tag.pid ] || kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null; do
+    while run_remote "while [ ! -s /workspace/logs/$tag.pid ] || kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null; do
     tail -1 /workspace/logs/$tag.log 2>/dev/null || true
     sleep \${WARCHEST_BOX_POLL:-60}
 done
 cat /workspace/logs/$tag.exit
-grep -qx 0 /workspace/logs/$tag.exit || { tail -20 /workspace/logs/$tag.log; exit 1; }" || status=$?
+grep -qx 0 /workspace/logs/$tag.exit || { tail -20 /workspace/logs/$tag.log; exit 1; }"; status=$?; [ "$status" -eq 255 ]; do
+        echo "connection to $host lost, reconnecting"
+        sleep 60
+    done
     [ -n "${3:-}" ] && "$0" pull "$3"
     [ "$status" -eq 0 ] && echo "JOB_DONE tag=$tag ok" || {
         echo "JOB_DONE tag=$tag failed"
