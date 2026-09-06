@@ -125,6 +125,21 @@ def offboard_pile_visibility(net, rng):
     print(f"off-board pile visibility ok: movement {movement:.3e}")
 
 
+def probe_parity(net):
+    row, phi, weight, seg, got = warchest.probe_values(0xB0BE, device=0)
+    row = np.asarray(row, np.uint8)
+    xpub = np.asarray(warchest.expand_rows(row), np.float32).reshape(1, -1)
+    phi = np.asarray(phi, np.float32).reshape(-1, CCOUNTS)
+    weight = np.asarray(weight, np.float32)
+    seg = np.asarray(seg, np.uint32)
+    got = np.asarray(got, np.float32)
+    want = run(net, xpub, phi, weight, seg, 2)
+    relative = np.abs(got - want) / np.maximum(np.maximum(np.abs(got), np.abs(want)), 1e-2)
+    worst = float(relative.max())
+    assert worst < 3e-3, f"probe differs from the network opinion by {worst:.3e}"
+    print(f"probe parity ok: {len(got)} configurations, worst {worst:.3e}")
+
+
 def packed_row_cuda_parity():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA parity requires a working GPU")
@@ -159,6 +174,7 @@ def main():
     net.push()
     slot_invariance(net, rng)
     offboard_pile_visibility(net, rng)
+    probe_parity(net)
     packed_row_cuda_parity()
 
 

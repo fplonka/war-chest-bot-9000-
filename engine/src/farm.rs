@@ -10,6 +10,7 @@ use crate::cuda::Device;
 use crate::search::{Budget, Solver, Step};
 use crate::contract::{Call, Reply};
 use crate::net::Net;
+use crate::reservoir::Reservoir;
 use crate::selfplay::{Data, GameCfg, GameStream};
 
 
@@ -199,6 +200,7 @@ impl Farm {
         let slot_bytes = cuda.slot_bytes();
         let slots_per_card = cuda.slots_per_card();
         let nets = Arc::new(RwLock::new(Arc::clone(&net)));
+        let reservoir = Arc::new(Mutex::new(Reservoir::new(seed ^ 0xA076_1D64_78BD_642F)));
         let ready = Arc::new(Queue::default());
         let device: Vec<JobQueue> =
             (0..gpus).map(|_| Arc::new(Queue::default())).collect();
@@ -213,7 +215,7 @@ impl Farm {
             let card_seed = seed.wrapping_mul(0x9E37_79B9) ^ g as u64;
             for slot in 0..per_gpu[g] {
                 let key = card_seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                let mut source = GameStream::new(key, gc);
+                let mut source = GameStream::with_reservoir(key, gc, Arc::clone(&reservoir));
                 let mut data = Data::default();
                 let mut solver = source.next_solve(&net, &mut data);
                 solver.pin(slot);
@@ -292,6 +294,7 @@ impl Farm {
         let mut jobs = std::mem::take(&mut *self.retired.lock());
         assert_eq!(jobs.len(), self.stats.slots() as usize, "a drain lost a game stream");
         for job in &mut jobs {
+            job.source.publish();
             job.solver = job.source.next_solve(&next, &mut job.data);
             job.solver.pin(job.slot);
         }

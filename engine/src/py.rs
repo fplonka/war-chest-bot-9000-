@@ -8,7 +8,11 @@ use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 use crate::farm::Farm;
 use crate::net::Net;
 use crate::search::{Budget, Cfg, Cfr, Ent};
-use crate::selfplay::{run_static_games, Agent, Collect, Data, GameCfg};
+#[cfg(feature = "gpu")]
+use crate::search::{Solver, Step};
+use crate::selfplay::{run_static_games, stronger, Agent, Collect, Data, GameCfg};
+#[cfg(feature = "gpu")]
+use crate::selfplay::collect_roots;
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use parking_lot::RwLock;
 use std::sync::{Arc, LazyLock};
@@ -148,6 +152,7 @@ impl SolveFarm {
             budget: Budget::for_s(s),
             ..Default::default()
         };
+        let query_cfg = stronger(cfg);
         let gc = GameCfg {
             agents: [Agent::Sog { cfg }; 2],
             collect: Collect::Sog,
@@ -160,7 +165,7 @@ impl SolveFarm {
         #[cfg(feature = "gpu")]
         {
             let net = Arc::clone(&nets().read());
-            let device = device_for(&devices, &net, cfg)?;
+            let device = device_for(&devices, &net, query_cfg)?;
             Ok(SolveFarm {
                 farm: Farm::new(seed, workers, gc, net, device),
             })
@@ -301,6 +306,58 @@ fn sample_rows(games: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+type ProbeValues = (Vec<u8>, Vec<f32>, Vec<f32>, Vec<u32>, Vec<f32>);
+
+#[pyfunction]
+#[pyo3(signature = (seed, device=0))]
+fn probe_values(seed: u64, device: usize) -> PyResult<ProbeValues> {
+    #[cfg(feature = "gpu")]
+    {
+        check_nets()?;
+        let net = Arc::clone(&nets().read());
+        let (state, belief) = collect_roots(1, seed).pop().expect("one sampled root");
+        let ctx = crate::pbs::Ctx::new(&state);
+        let mut row = vec![0; crate::pbs::ROW_BYTES];
+        crate::pbs::pack_row(&state, &ctx, &mut row);
+        let mut phi = Vec::new();
+        let mut weight = Vec::new();
+        let mut seg = Vec::new();
+        for p in 0..2 {
+            let reserve = crate::pbs::reserve(&state, p as u8, &ctx);
+            for (config, &mass) in belief[p].cfg.iter().zip(&belief[p].p) {
+                let at = phi.len();
+                phi.resize(at + crate::pbs::CFEAT, 0.0);
+                crate::pbs::write_config_feats(config, &reserve, &mut phi[at..]);
+                weight.push(mass);
+                seg.push(p as u32);
+            }
+        }
+        let cfg = Cfg::default();
+        let card = crate::cuda::Device::new(&[device], &net, cfg, 1)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let mut solver = Solver::probe(&state, ctx, net, cfg, belief, crate::rng::Rng::new(seed));
+        solver.pin(0);
+        let mut replies = Vec::new();
+        let solved = loop {
+            match solver.advance(&replies) {
+                Step::Calls(calls) => {
+                    replies = card.run(&calls, 0).ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err("the card could not run the probe")
+                    })?;
+                }
+                Step::Done(solved) => break solved.expect("a probe returns values"),
+            }
+        };
+        let value = [solved.value[0].clone(), solved.value[1].clone()].concat();
+        Ok((row, phi, weight, seg, value))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (seed, device);
+        Err(pyo3::exceptions::PyRuntimeError::new_err("warchest was built without CUDA"))
+    }
+}
+
 #[pyfunction]
 fn mirror_rows(rows: PyReadonlyArray1<u8>) -> PyResult<Vec<u8>> {
     use crate::pbs::{mirror_row, ROW_BYTES};
@@ -366,6 +423,7 @@ fn expand_rows_cuda(
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mirror_rows, m)?)?;
     m.add_function(wrap_pyfunction!(sample_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(probe_values, m)?)?;
     m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
     m.add_function(wrap_pyfunction!(hex_location_flags, m)?)?;
     m.add_class::<SolveFarm>()?;

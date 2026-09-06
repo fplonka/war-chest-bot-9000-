@@ -14,6 +14,7 @@ pub mod net;
 pub mod packed;
 pub mod pbs;
 pub mod policy;
+pub mod reservoir;
 pub mod rng;
 pub mod rules;
 pub mod search;

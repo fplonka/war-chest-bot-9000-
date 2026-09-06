@@ -3,12 +3,14 @@ use crate::board::NONE;
 use crate::net::Net;
 use crate::pbs::*;
 use crate::policy;
+use crate::reservoir::{disagreement, priority_index, Reservoir, Task};
 use crate::rng::Rng;
 use crate::search::{Cfg, Solved, Solver};
 use crate::state::{Cont, State, BLACK, WHITE};
 #[cfg(feature = "python")]
 use rayon::prelude::*;
 use std::collections::VecDeque;
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 const STARTER_WHITE: [u16; 4] = [17, 12, 4, 9];
@@ -208,17 +210,24 @@ fn draw_count(rng: &mut Rng, rate: f32) -> usize {
     (rng.unit_f64() < rate as f64) as usize
 }
 
+pub fn stronger(mut cfg: Cfg) -> Cfg {
+    cfg.s = cfg.s.checked_mul(2).expect("query expansion count overflow");
+    cfg.budget = crate::search::Budget::for_s(cfg.s);
+    cfg
+}
+
 pub fn query_solver(
     nets: &Arc<Net>,
     cfg: Cfg,
     recursive_rate: f32,
     s: &State,
+    ctx: Ctx,
     bel: &[Belief; 2],
     rng: &mut Rng,
 ) -> Solver {
     let mut sv = Solver::new(
         s,
-        Ctx::new(s),
+        ctx,
         Arc::clone(nets),
         cfg,
         bel.clone(),
@@ -404,6 +413,8 @@ pub struct GameStream {
     gc: GameCfg,
     game: Game,
     pending: VecDeque<(State, [Belief; 2])>,
+    reservoir: Arc<Mutex<Reservoir>>,
+    task: Option<Task>,
     kind: SolveKind,
     query_turn: bool,
     rng: Rng,
@@ -413,18 +424,24 @@ pub struct GameStream {
 #[repr(u32)]
 pub(crate) enum SolveKind {
     Play,
-    Query,
+    Fresh,
+    Revisit,
+    Probe,
 }
 
 impl SolveKind {
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
-    pub const NAMES: [&'static str; 2] = ["play", "query"];
+    pub const NAMES: [&'static str; 4] = ["play", "fresh", "revisit", "probe"];
 }
 
 const QUEUE_CAP: usize = 64;
 
 impl GameStream {
     pub fn new(seed: u64, gc: GameCfg) -> GameStream {
+        Self::with_reservoir(seed, gc, Arc::new(Mutex::new(Reservoir::new(seed))))
+    }
+
+    pub fn with_reservoir(seed: u64, gc: GameCfg, reservoir: Arc<Mutex<Reservoir>>) -> GameStream {
         let game = Game::new(Rng::new(worker_seed(seed, 0)), &gc);
         GameStream {
             seed,
@@ -432,19 +449,34 @@ impl GameStream {
             gc,
             game,
             pending: VecDeque::new(),
+            reservoir,
+            task: None,
             kind: SolveKind::Play,
             query_turn: false,
             rng: Rng::new(worker_seed(seed, usize::MAX)),
         }
     }
 
+    pub fn publish(&mut self) {
+        if let Some(Task::Probe { scores, .. }) = self.task.as_mut() {
+            scores.clear();
+        }
+    }
+
     pub fn next_solve(&mut self, nets: &Arc<Net>, out: &mut Data) -> Solver {
-        if self.query_turn {
-            self.query_turn = false;
-            if let Some(sv) = self.next_query(nets) {
-                self.kind = SolveKind::Query;
-                return sv;
+        if self.task.is_none() && std::mem::take(&mut self.query_turn) {
+            self.task = self.reservoir.lock().pick();
+            if self.task.is_none() {
+                if let Some((state, belief)) = self.pending.pop_front() {
+                    self.kind = SolveKind::Fresh;
+                    let cfg = self.query_cfg(&state);
+                    let ctx = Ctx::new(&state);
+                    return query_solver(nets, cfg, self.gc.recursive_rate, &state, ctx, &belief, &mut self.rng);
+                }
             }
+        }
+        if self.task.is_some() {
+            return self.task_solver(nets);
         }
         self.query_turn = true;
         self.kind = SolveKind::Play;
@@ -469,19 +501,82 @@ impl GameStream {
                 out.dropped += self.enqueue(queued);
                 out.merge(self.game.take_ready());
             }
-            SolveKind::Query => {
+            SolveKind::Fresh => {
+                if let Some(result) = solved.as_ref() {
+                    self.reservoir.lock().admit(
+                        sv.nodes[0].state,
+                        sv.ctx,
+                        sv.root_belief.clone(),
+                        result.value.clone(),
+                    );
+                }
                 let more = keep_query(sv, solved, out);
                 out.dropped += self.enqueue(more);
+            }
+            SolveKind::Revisit => {
+                let Some(Task::Revisit { index, entry }) = self.task.take() else {
+                    unreachable!("a revisit lost its reservoir entry")
+                };
+                if let Some(result) = solved.as_ref() {
+                    self.reservoir.lock().refresh(index, entry.generation, result.value.clone());
+                }
+                let more = keep_query(sv, solved, out);
+                out.dropped += self.enqueue(more);
+            }
+            SolveKind::Probe => self.keep_probe(solved),
+        }
+    }
+
+    fn query_cfg(&self, state: &State) -> Cfg {
+        let Agent::Sog { cfg } = self.gc.agents[state.to_act() as usize] else {
+            unreachable!("only a search agent nominates queries")
+        };
+        stronger(cfg)
+    }
+
+    fn task_solver(&mut self, nets: &Arc<Net>) -> Solver {
+        match self.task.as_ref().expect("a query task exists") {
+            Task::Revisit { entry, .. } => {
+                self.kind = SolveKind::Revisit;
+                query_solver(
+                    nets,
+                    self.query_cfg(&entry.state),
+                    self.gc.recursive_rate,
+                    &entry.state,
+                    entry.ctx,
+                    &entry.belief,
+                    &mut self.rng,
+                )
+            }
+            Task::Probe { entries, scores } => {
+                self.kind = SolveKind::Probe;
+                let entry = &entries[scores.len()].1;
+                Solver::probe(
+                    &entry.state,
+                    entry.ctx,
+                    Arc::clone(nets),
+                    self.query_cfg(&entry.state),
+                    entry.belief.clone(),
+                    Rng::new(self.rng.next_u64()),
+                )
             }
         }
     }
 
-    fn next_query(&mut self, nets: &Arc<Net>) -> Option<Solver> {
-        let (s, bel) = self.pending.pop_front()?;
-        let Agent::Sog { cfg } = self.gc.agents[s.to_act() as usize] else {
-            return None;
+    fn keep_probe(&mut self, solved: Option<Solved>) {
+        let Some(Task::Probe { entries, scores }) = self.task.as_mut() else {
+            unreachable!("a probe lost its candidates")
         };
-        Some(query_solver(nets, cfg, self.gc.recursive_rate, &s, &bel, &mut self.rng))
+        let at = scores.len();
+        let score = solved
+            .map(|result| disagreement(&result.value, &entries[at].1.value))
+            .unwrap_or(f32::NEG_INFINITY);
+        scores.push(score);
+        if scores.len() < entries.len() {
+            return;
+        }
+        let (index, entry) = entries[priority_index(entries, scores)].clone();
+        self.task = Some(Task::Revisit { index, entry: Box::new(entry) });
     }
 
     fn end_game(&mut self, out: &mut Data) {
@@ -534,7 +629,7 @@ fn worker_seed(seed: u64, i: usize) -> u64 {
     seed.wrapping_mul(0x9E3779B97F4A7C15) ^ (i as u64).wrapping_mul(0xD1B54A32D192ED03)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "python"))]
 fn resolve_fixture_chance(game: &mut Game) {
     while game.s.is_chance() {
         let player = game.s.to_act();
@@ -546,7 +641,7 @@ fn resolve_fixture_chance(game: &mut Game) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "python"))]
 pub(crate) fn collect_roots(count: usize, seed: u64) -> Vec<(State, [Belief; 2])> {
     let gc = GameCfg {
         agents: [Agent::Random; 2],
@@ -592,6 +687,15 @@ pub(crate) fn run_static_games(games: usize, seed: u64, nets: &Arc<Net>, gc: &Ga
 mod target_tests {
     use super::*;
     use crate::search::Cfg;
+
+    #[test]
+    fn queries_get_twice_the_mainline_budget() {
+        let cfg = Cfg { s: 73, ..Default::default() };
+        let query = stronger(cfg);
+        assert_eq!(query.s, 146);
+        assert_eq!(query.budget, crate::search::Budget::for_s(146));
+        assert_eq!(cfg.s, 73);
+    }
 
     #[test]
     fn a_full_query_queue_reports_every_dropped_nomination() {

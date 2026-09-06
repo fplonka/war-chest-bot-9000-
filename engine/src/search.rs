@@ -540,6 +540,20 @@ impl Drop for Solver {
 
 impl Solver {
     pub fn new(root: &State, ctx: Ctx, net: Arc<Net>, cfg: Cfg, belief: [Belief; 2], rng: Rng) -> Solver {
+        let mut solver = Self::root(root, ctx, net, cfg, belief, rng);
+        solver.expand(0);
+        solver
+    }
+
+    pub fn probe(root: &State, ctx: Ctx, net: Arc<Net>, mut cfg: Cfg, belief: [Belief; 2], rng: Rng) -> Solver {
+        cfg.s = 1;
+        cfg.c = 0.0;
+        let mut solver = Self::root(root, ctx, net, cfg, belief, rng);
+        solver.collect(0);
+        solver
+    }
+
+    fn root(root: &State, ctx: Ctx, net: Arc<Net>, cfg: Cfg, belief: [Belief; 2], rng: Rng) -> Solver {
         let root_configs: usize = belief.iter().map(Belief::len).sum();
         assert!(
             root_configs <= 2 * crate::pbs::MAX_CONFIG_SUPPORT,
@@ -564,8 +578,7 @@ impl Solver {
         sv.nodes.reserve(640);
         sv.cur.reserve(640);
         sv.seed = Rng::new(sv.rng.next_u64()).0;
-        let root = sv.push_node(crate::contract::NO_ROW, *root, cfgs);
-        sv.expand(root);
+        sv.push_node(crate::contract::NO_ROW, *root, cfgs);
         sv
     }
 
