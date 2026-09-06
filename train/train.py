@@ -35,6 +35,8 @@ NSLOT = warchest.NSLOT
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
 POLICY_METRICS = ("policy_loss", "policy_target_entropy", "policy_prior_entropy",
                   "policy_search_kl")
+TERMINAL_CAP = 50_000
+TERMINAL_WEIGHT = 0.1
 
 
 def fold(window, lists, stat):
@@ -83,7 +85,6 @@ class Buffer:
         self.source = np.zeros(cap, np.uint8)
         self.truth = np.zeros((cap, 2), np.uint32)
         self.outcome = np.full((cap, 2), np.nan, np.float32)
-        self.td1 = np.zeros(cap, np.uint8)
         self.acts = 0
         self.cells = 0
         self.rows = 0
@@ -92,7 +93,7 @@ class Buffer:
 
     _ROW_FIELDS = (
         "x", "cstart", "clen", "pastart", "palen", "pcstart", "pclen",
-        "written_at", "created_at", "source", "truth", "outcome", "td1")
+        "written_at", "created_at", "source", "truth", "outcome")
     _ARENAS = (
         ("cstart", "clen", ("cc", "cw", "cy"), "cfgs", "ccap"),
         ("pastart", "palen", ("pa",), "acts", "acap"),
@@ -143,7 +144,7 @@ class Buffer:
         self.soff = np.asarray(state["soff"], np.int64).copy()
 
     def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, created,
-            td1, pol=None):
+            pol=None):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         m = len(cw)
@@ -175,7 +176,6 @@ class Buffer:
             self.source[ring] = source[i:j]
             self.truth[ring] = truth[i:j]
             self.outcome[ring] = outcome[i:j]
-            self.td1[ring] = td1[i:j]
         sl = (np.arange(m) + self.cfgs) % self.ccap
         self.cc[sl], self.cw[sl], self.cy[sl] = cc, cw, cy
         if pol is not None:
@@ -265,23 +265,16 @@ class Buffer:
         ids = np.arange(self.lo, self.rows, dtype=np.int64) % self.cap
         n = max(len(ids), 1)
         source = np.bincount(self.source[ids], minlength=3)
-        configs = self.clen[ids].sum(dtype=np.int64)
         return {
             "replay_warm_frac": source[0] / n,
             "replay_play_frac": source[1] / n,
             "replay_query_frac": source[2] / n,
-            "replay_td1_row_frac": float(self.td1[ids].sum()) / n,
-            "replay_td1_target_frac": 2.0 * self.td1[ids].sum() / max(configs, 1),
             "target_age_max": (time.time() - self.created_at[ids].min()
                                if len(ids) else 0.0),
         }
 
-    def sample_calibration(self, batch, rng):
-        ids = np.arange(self.lo, self.rows, dtype=np.int64)
-        ids = ids[np.isfinite(self.outcome[ids % self.cap, 0])]
-        if not len(ids):
-            return None
-        ids = rng.choice(ids, size=min(batch, len(ids)), replace=False)
+    def sample_truth(self, batch, rng):
+        ids = rng.integers(self.lo, self.rows, size=batch)
         ring = ids % self.cap
         parts = self.gather(ids)
         lens = self.clen[ring].astype(np.int64)
@@ -354,7 +347,7 @@ def policy_loss(net, pieces, seg, policy):
 
 
 @torch.no_grad()
-def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
+def diagnostics(net, buf, terminal, probe, batch, rng, device, batch_fn, recent_frac):
     nan = float("nan")
     out = {
         "probe_std": float(forward_values(net, probe).std()) if probe is not None else nan,
@@ -373,10 +366,9 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
                    rng, device)
     out["loss_old"] = float(losses(net, *old, wp=0.0)[0])
     out["loss_new"] = float(losses(net, *new, wp=0.0)[0])
-    calibration = buf.sample_calibration(batch, rng)
-    if calibration is None:
+    if not len(terminal):
         return out
-    sampled, at, outcome = calibration
+    sampled, at, outcome = terminal.sample_truth(batch, rng)
     parts = batch_fn(sampled, rng, device)
     pred = forward_values(net, parts)[torch.as_tensor(at, device=device)].float().cpu().numpy()
     error = pred - outcome
@@ -401,7 +393,7 @@ def accumulate(acc, stats):
             acc[key] = acc.get(key, 0) + value
 
 
-def train_steps(net, opt, buf, steps, batch, rng, device,
+def train_steps(net, opt, buf, terminal, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
                 batch_fn=None, policy_w=0.0, deadline=None):
     stat = collections.Counter()
@@ -428,8 +420,6 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         for source_id_value, name in enumerate(("warm", "play", "query")):
             stat[f"sample_{name}_delay_sum"] += float(
                 delay[source_id == source_id_value].sum())
-        stat["sample_td1_targets"] += 2 * int(buf.td1[ring].sum())
-        stat["sample_targets"] += int(buf.clen[ring].sum())
         sampled = buf.gather(ids)
         stat["batch_configs"] += len(sampled[1])
         parts = batch_fn(sampled, rng, device)
@@ -439,6 +429,14 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         loss, step_stat = losses(net, *parts, wp=policy_w)
+        if len(terminal):
+            truth, at, outcome = terminal.sample_truth(batch, rng)
+            predicted = forward_values(net, batch_fn(truth, rng, device))
+            lt = F.mse_loss(predicted[torch.as_tensor(at, device=device)],
+                            torch.as_tensor(outcome, device=device))
+            loss = loss + TERMINAL_WEIGHT * lt
+            step_stat["terminal_loss_sum"] = lt.detach()
+            stat["terminal_steps"] += 1
         stat["steps"] += 1
         stat["zero_sum_n"] += parts[5] // 2
         stat["policy_steps"] += "policy_loss_sum" in step_stat
@@ -464,7 +462,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     return stat.pop("value_loss") / stat["steps"], stat
 
 
-def ingest(buf, data, warm=False):
+def ingest(buf, terminal, data, warm=False):
     x = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
     cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
     cw = np.asarray(data["cw"], np.float32)
@@ -474,6 +472,8 @@ def ingest(buf, data, warm=False):
     if bad_cw or bad_cy:
         raise SystemExit(
             f"non-finite collect values: data['cw']={bad_cw}, data['cy']={bad_cy}")
+    if "terminal" in data:
+        ingest(terminal, terminal, data["terminal"])
     if not len(x):
         return 0
     cy = np.clip(cy, -1.0, 1.0)
@@ -484,7 +484,6 @@ def ingest(buf, data, warm=False):
     truth = np.asarray(data["truth"], np.uint32).reshape(-1, 2)
     outcome = np.asarray(data["outcome"], np.float32).reshape(-1, 2)
     created = np.asarray(data["created"], np.float64)
-    td1 = np.asarray(data["td1"], np.uint8)
     pol = (np.asarray(data["pa"], np.uint8).reshape(-1, ACT_BYTES),
            np.asarray(data["paoff"], np.int64),
            np.asarray(data["pcoff"], np.int64),
@@ -492,7 +491,7 @@ def ingest(buf, data, warm=False):
            np.asarray(data["pcell"], np.uint16),
            np.asarray(data["pprob"], np.float16))
     buf.add(x, cc, cw, cy.astype(np.float16), coff, soff,
-            source, truth, outcome, created, td1, pol)
+            source, truth, outcome, created, pol)
     return len(x)
 
 
@@ -674,6 +673,7 @@ def main():
     value = Net().to(dev)
     opt = torch.optim.Adam(value.parameters(), lr=args.lr, fused=True)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
+    terminal = Buffer(TERMINAL_CAP, TERMINAL_CAP * args.cfgs_per_row)
     if checkpoint:
         value.load_state_dict(checkpoint["value"])
         opt.load_state_dict(checkpoint["optimizer"])
@@ -684,6 +684,7 @@ def main():
         torch.set_rng_state(checkpoint["torch_rng"])
         torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
         buf.load_state_dict(checkpoint["buffer"])
+        terminal.load_state_dict(checkpoint["terminal"])
     else:
         if args.init_weights:
             value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
@@ -739,6 +740,7 @@ def main():
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all(),
             "buffer": buf.state_dict(),
+            "terminal": terminal.state_dict(),
             "elapsed": float(el),
             "next_snapshot": float(el + snap_gap),
             "epoch": epoch,
@@ -780,7 +782,7 @@ def main():
             return float("nan"), 0.0, {}
         tt = time.time()
         lv, st = train_steps(
-            value, opt, buf, nsteps, args.batch, rng, dev,
+            value, opt, buf, terminal, nsteps, args.batch, rng, dev,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
             batch_fn=batcher, policy_w=args.policy_w, deadline=deadline)
@@ -839,7 +841,7 @@ def main():
             gen_s = time.time() - gen_t
 
             ta = time.time()
-            n = ingest(buf, data)
+            n = ingest(buf, terminal, data)
             add_s = time.time() - ta
             cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
             cw = np.asarray(data["cw"], np.float32)
@@ -901,10 +903,11 @@ def main():
             next_report = now + 10.0
             steps = int(window["train_steps"])
             lv = window["loss_sum"] / max(steps, 1)
+            tl = window["terminal_loss_sum"] / max(window["terminal_steps"], 1)
             if probe is None and len(buf) >= 2048:
                 probe = batcher(buf.sample(2048, diag_rng), diag_rng, dev)
-            diag = diagnostics(value, buf, probe, args.batch, diag_rng, dev, batcher,
-                               args.recent_frac)
+            diag = diagnostics(value, buf, terminal, probe, args.batch, diag_rng, dev,
+                               batcher, args.recent_frac)
             target_n = max(int(window["target_n"]), 1)
             target_mean = window["target_sum"] / target_n
             target_var = max(
@@ -975,7 +978,8 @@ def main():
                     "games", "white_wins", "black_wins", "draws", "decisions",
                     "rows", "solves", "query_rows", "dropped")},
                 "loss": round(lv, 5),
-                "total_loss": round(lv + args.policy_w * policy["policy_loss"], 5),
+                "total_loss": round(lv + args.policy_w * policy["policy_loss"]
+                                    + TERMINAL_WEIGHT * tl, 5),
                 **{key: round(diag[key], 5) for key in ("loss_old", "loss_new")},
                 "zero_sum_max": round(window["zero_sum_max"], 5),
                 "zero_sum_rms": round((window["zero_sum_square_sum"]
@@ -1041,8 +1045,8 @@ def main():
                 "sample_warm_frac": round(window["sample_warm"] / sample_n, 4),
                 "sample_play_frac": round(window["sample_play"] / sample_n, 4),
                 "sample_query_frac": round(window["sample_query"] / sample_n, 4),
-                "sample_td1_target_frac": round(
-                    window["sample_td1_targets"] / max(window["sample_targets"], 1), 5),
+                "terminal_rows": len(terminal),
+                "terminal_loss": round(tl, 5),
                 **{key: round(value, 5) for key, value in replay.items()},
                 "solves_per_s": round(raw_sps, 1),
                 **{key: round(value, 5) for key, value in policy.items()},
@@ -1127,7 +1131,7 @@ def main():
                 explore=args.explore, random_draft=args.random_draft,
                 temp=args.temp)
             gen_s = time.time() - tg
-            n = ingest(buf, d, warm=True)
+            n = ingest(buf, terminal, d, warm=True)
             steps = max(1, n // args.batch) if len(buf) >= args.batch else 0
             lv, train_s, _ = fit(steps)
             cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
@@ -1155,7 +1159,7 @@ def main():
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
-    del value, opt, probe, buf
+    del value, opt, probe, buf, terminal
     torch.cuda.empty_cache()
     subprocess.run([sys.executable, str(ROOT / "tools" / "pack.py"),
                     args.out], check=True)

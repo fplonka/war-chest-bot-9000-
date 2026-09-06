@@ -83,7 +83,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         ("outcomes", d.outcome.len(), 2 * d.nv),
         ("creation times", d.created.len(), d.nv),
         ("query labels", d.query.len(), d.nv),
-        ("TD(1) labels", d.td1.len(), d.nv),
     ] {
         assert_eq!(got, want, "{name} do not match the row count");
     }
@@ -104,7 +103,10 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, coff = d.coff,
         pa = d.pa, paoff = d.paoff, pcoff = d.pcoff, pci = d.pci,
         pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome,
-        created = d.created, query = d.query, td1 = d.td1, soff = soff,
+        created = d.created, query = d.query, soff = soff,
+    }
+    if let Some(t) = d.terminal {
+        out.set_item("terminal", data_to_dict(py, *t)?)?;
     }
     out.set_item("row_bytes", crate::pbs::ROW_BYTES)?;
     out.set_item("solves", n_solves)?;

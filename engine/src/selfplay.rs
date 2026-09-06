@@ -61,7 +61,7 @@ pub struct Data {
     pub created: Vec<f64>,
     solve_created: f64,
     pub query: Vec<u8>,
-    pub td1: Vec<u8>,
+    pub terminal: Option<Box<Data>>,
     pub plays: [usize; N_PLAYS],
 
     pub coff: Vec<u32>,
@@ -89,7 +89,10 @@ impl Data {
         macro_rules! append {
             ($($name:ident),* $(,)?) => { $( self.$name.extend(o.$name); )* };
         }
-        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query, td1);
+        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query);
+        if let Some(t) = o.terminal {
+            self.terminal.get_or_insert_with(Default::default).merge(*t);
+        }
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
@@ -165,14 +168,9 @@ impl Data {
         self.outcome.extend([f32::NAN; 2]);
         self.created.push(self.solve_created);
         self.query.push(0);
-        self.td1.push(0);
         self.nv += 1;
     }
 
-    #[inline]
-    pub fn row_span(&self, r: usize, p: usize) -> std::ops::Range<usize> {
-        self.coff[2 * r + p] as usize..self.coff[2 * r + p + 1] as usize
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -197,7 +195,6 @@ pub struct Game {
     gc: GameCfg,
     queries: Vec<(State, [Belief; 2])>,
     main_plays: u16,
-    last_value: [f32; 2],
 }
 
 fn draw_count(rng: &mut Rng, rate: f32) -> usize {
@@ -266,7 +263,6 @@ impl Game {
             gc: *gc,
             queries: Vec::new(),
             main_plays: 0,
-            last_value: [0.0; 2],
         }
     }
 
@@ -340,13 +336,11 @@ impl Game {
 
     fn record(&mut self, value: [&[f32]; 2], policy: &crate::search::Policy) {
         let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
-        self.last_value = std::array::from_fn(|p| value[p][truth[p] as usize]);
-        let outcome_needed = self.label.unit_f64() < self.gc.p_td1 as f64;
-        let data = if outcome_needed { &mut self.pending } else { &mut self.ready };
-        data.begin_solve();
-        data.push_value(&self.s, &self.ctx, &self.bel, value, truth, policy);
-        if outcome_needed {
-            *data.td1.last_mut().expect("the row just pushed") = 1;
+        self.ready.begin_solve();
+        self.ready.push_value(&self.s, &self.ctx, &self.bel, value, truth, policy);
+        if self.label.unit_f64() < self.gc.p_td1 as f64 {
+            self.pending.begin_solve();
+            self.pending.push_value(&self.s, &self.ctx, &self.bel, value, truth, policy);
         }
     }
 
@@ -374,21 +368,12 @@ impl Game {
 
     pub fn finish(&mut self) {
         let ended = self.s.is_terminal();
-        let (z, outcome) = if ended {
-            let z = [self.s.utility(0), self.s.utility(1)];
-            (z, z)
-        } else {
-            (self.last_value, [f32::NAN; 2])
-        };
-        for r in 0..self.pending.nv {
-            for p in 0..2 {
-                self.pending.outcome[2 * r + p] = outcome[p];
-                let at = self.pending.row_span(r, p).start + self.pending.truth[2 * r + p] as usize;
-                self.pending.cy[at] = z[p];
-            }
+        let mut pending = std::mem::take(&mut self.pending);
+        if ended {
+            let outcome = [self.s.utility(0), self.s.utility(1)];
+            pending.outcome = outcome.repeat(pending.nv);
+            self.ready.terminal.get_or_insert_with(Default::default).merge(pending);
         }
-        let pending = std::mem::take(&mut self.pending);
-        self.ready.merge(pending);
         self.ready.games += 1;
         match self.s.winner() {
             Some(w) => self.ready.wins[w as usize] += 1,
@@ -615,6 +600,33 @@ mod target_tests {
         out.dropped += stream.enqueue(nominations);
         assert_eq!(stream.pending.len(), QUEUE_CAP);
         assert_eq!(out.dropped, 3);
+    }
+
+    #[test]
+    fn returns_label_copies_of_naturally_ended_games_only() {
+        let gc = GameCfg {
+            agents: [Agent::Random; 2],
+            collect: Collect::None,
+            explore: 0.0,
+            random_draft: true,
+            p_td1: 1.0,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        for winner in [None, Some(WHITE)] {
+            let mut game = Game::new(Rng::new(17), &gc);
+            resolve_fixture_chance(&mut game);
+            let values = [vec![0.25; game.bel[0].len()], vec![-0.5; game.bel[1].len()]];
+            game.record([&values[0], &values[1]], &Default::default());
+            let targets = game.ready.cy.clone();
+            if let Some(w) = winner {
+                game.s.winner = w;
+            }
+            game.finish();
+            assert_eq!(game.ready.cy, targets);
+            let labels = game.ready.terminal.as_ref().map(|t| t.outcome.clone());
+            assert_eq!(labels, winner.map(|_| vec![1.0, -1.0]));
+        }
     }
 
     #[test]
