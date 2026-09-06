@@ -121,16 +121,25 @@ class Net(nn.Module):
 
     def configs(self, phi, own, seg):
         counts = phi.reshape(-1, 3, NSLOT).transpose(1, 2)
-        query = self.cfg_in(torch.cat([counts, own[seg]], -1)).sum(1)
+        query = gelu(self.cfg_in(torch.cat([counts, own[seg]], -1))).sum(1)
         return gelu(self.ln_cfg(query + self.cfg_seat(seg % 2)))
 
     def attend(self, query, tokens, board_of):
-        q = self.attn_q(query).reshape(-1, HEADS, HEAD)
-        k = self.attn_k(tokens).reshape(*tokens.shape[:2], HEADS, HEAD)
-        v = self.attn_v(tokens).reshape(*tokens.shape[:2], HEADS, HEAD)
-        score = torch.einsum("qhd,qthd->qht", q, k[board_of]) * HEAD ** -0.5
-        mixed = torch.einsum("qht,qthd->qhd", score.softmax(-1), v[board_of])
-        mixed = self.attn_out(mixed.flatten(1))
+        boards, ntokens = tokens.shape[:2]
+        counts = torch.bincount(board_of, minlength=boards)
+        starts = counts.cumsum(0) - counts
+        order = board_of.argsort()
+        slot = torch.empty_like(board_of)
+        slot[order] = torch.arange(query.shape[0], device=query.device) - starts[board_of[order]]
+        width = int(counts.max())
+        q = query.new_zeros(boards, width, ATTN)
+        q[board_of, slot] = self.attn_q(query)
+        q = q.reshape(boards, width, HEADS, HEAD).transpose(1, 2)
+        k = self.attn_k(tokens).reshape(boards, ntokens, HEADS, HEAD).transpose(1, 2)
+        v = self.attn_v(tokens).reshape(boards, ntokens, HEADS, HEAD).transpose(1, 2)
+        mixed = F.scaled_dot_product_attention(q, k, v)
+        mixed = mixed.transpose(1, 2).reshape(boards, width, ATTN)
+        mixed = self.attn_out(mixed[board_of, slot])
         return self.ln_attn(query + mixed)
 
     def belief_context(self, conditioned, weight, seg, nseg):

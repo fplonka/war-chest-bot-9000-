@@ -9,7 +9,7 @@ import torch.nn as nn
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import warchest
-from value_net import Net
+from value_net import ATTN, HEAD, HEADS, TYPE, Net
 
 PUBFEAT = warchest.PUBFEAT
 N_HEXES = warchest.N_HEXES
@@ -122,6 +122,47 @@ def attention_token_relabelling(net, rng):
     print("attention token relabelling ok")
 
 
+def configuration_card_identity(net, rng):
+    own = torch.from_numpy(rng.standard_normal((2, NSLOT, TYPE)).astype(np.float32))
+    phi = torch.zeros(2, 3 * NSLOT)
+    phi[0, 0] = phi[1, 1] = 1
+    seg = torch.zeros(2, dtype=torch.long)
+    query = net.configs(phi, own, seg)
+    assert (query[0] - query[1]).abs().max() > 1e-3
+    perm = torch.as_tensor(rng.permutation(NSLOT))
+    relabelled = net.configs(
+        phi.reshape(2, 3, NSLOT)[:, :, perm].reshape(2, -1), own[:, perm], seg)
+    torch.testing.assert_close(relabelled, query)
+    print("configuration card identity ok")
+
+
+def attention_reference(net, rng):
+    ntokens = N_HEXES + NTYPE
+    for ids in ([2, 0, 2, 2, 0, 3, 2], [1], []):
+        query = torch.from_numpy(rng.standard_normal((len(ids), ATTN)).astype(np.float32))
+        tokens = torch.from_numpy(rng.standard_normal((4, ntokens, ATTN)).astype(np.float32))
+        query.requires_grad_()
+        tokens.requires_grad_()
+        board_of = torch.tensor(ids, dtype=torch.long)
+        got = net.attend(query, tokens, board_of)
+        q = net.attn_q(query).reshape(len(ids), HEADS, HEAD)
+        k = net.attn_k(tokens)[board_of].reshape(len(ids), ntokens, HEADS, HEAD)
+        v = net.attn_v(tokens)[board_of].reshape(len(ids), ntokens, HEADS, HEAD)
+        scores = torch.einsum("qhd,qthd->qht", q, k) * HEAD ** -0.5
+        mixed = torch.einsum("qht,qthd->qhd", scores.softmax(-1), v)
+        want = net.ln_attn(query + net.attn_out(mixed.flatten(1)))
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+        inputs = (query, tokens, *net.attn_q.parameters(), *net.attn_k.parameters(),
+                  *net.attn_v.parameters(), *net.attn_out.parameters(),
+                  *net.ln_attn.parameters())
+        upstream = torch.from_numpy(rng.standard_normal(got.shape).astype(np.float32))
+        got_grad = torch.autograd.grad(got, inputs, upstream)
+        want_grad = torch.autograd.grad(want, inputs, upstream)
+        for actual, expected in zip(got_grad, want_grad):
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+    print("attention outputs and gradients ok")
+
+
 def cross_board_isolation(net, rng):
     sizes = [3, 4, 2, 5]
     xpub = public_rows(rng, 2)
@@ -182,6 +223,8 @@ def packed_row_cuda_parity():
 def main():
     rng = np.random.default_rng(11)
     net = random_net(7)
+    configuration_card_identity(net, rng)
+    attention_reference(net, rng)
     attention_token_relabelling(net, rng)
     cross_board_isolation(net, rng)
     slot_invariance(net, rng)
