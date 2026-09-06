@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -11,25 +10,27 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
-use crate::board::{board, N_HEXES, NONE};
+use crate::board::{board, NONE, N_HEXES};
 use crate::contract::{Call, Prime, Reply};
 use crate::net::{
-    ln_block, Net, NetLayout, NormSpan, Span, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
-    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
+    ln_block, Net, NetLayout, NormSpan, Span, ATTN, BLOCKS, C, D, HEADS, LN_ACT, LN_ATTN, LN_CFG,
+    LN_TRUNK, TYPE,
 };
 use crate::pbs::{
     CFEAT, HEX_BLOCK, HEX_CH, HEX_FACTS, LOOSE, MAX_COINS, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
     OFF_PILES, PILE_COUNTS, PLAYER_SCALARS, PUBFEAT, ROW_BAG_SIZE, ROW_BYTES, ROW_FD_SIZE,
     ROW_HAND_SIZE, ROW_HEX_HEIGHT, ROW_HEX_MARKER, ROW_HEX_OWNER, ROW_HEX_SLOT, ROW_IDS,
-    ROW_INITIATIVE, ROW_INIT_MOVED, ROW_PILES, ROW_STACK_KIND, ROW_STACK_OWED, ROW_WP,
-    ROW_TO_ACT,
+    ROW_INITIATIVE, ROW_INIT_MOVED, ROW_PILES, ROW_STACK_KIND, ROW_STACK_OWED, ROW_TO_ACT, ROW_WP,
 };
 use crate::search::{Cfg, Cfr, Ent};
 use crate::state::{CONT_CAP, PENDING_KINDS};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 mod slot;
-use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF};
+use slot::{
+    Arr, Solve, B_P, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, DESC, FIELDS, G_QUERY, I_AIDX,
+    R_REACH, R_VALS, Y_BOARD_OF, Y_COFF,
+};
 
 type Res<T> = Result<T, String>;
 
@@ -63,17 +64,21 @@ kernels! {
     finish,
     tokens,
     act_feats,
-    prior_inputs,
     act_add,
     prior,
     hex_facts,
     type_pool,
     stem,
     trunk,
+    public_cache,
+    attention,
+    attention_residual,
     cfg_slots,
+    cfg_seat,
     sum_slots,
-    bag,
-    leaf,
+    belief,
+    value,
+    policy_inputs,
     leaf_scale,
     reach_sweep,
     backprop_sweep,
@@ -146,26 +151,13 @@ fn tf32(v: f32) -> f32 {
     f32::from_bits(u.wrapping_add(0x1000) & 0xFFFF_E000)
 }
 
-const JOIN_K: usize = JOIN_IN.next_multiple_of(8);
-const _: () = assert!(JOIN_K == 136 && JOIN_IN == 129);
-
-fn pack_mma(w: &[f32], base: usize, k_real: usize, k_pad: usize, n: usize, out: &mut Vec<f32>) {
-    assert_eq!(k_pad % 8, 0, "a packed matrix is whole fragments deep");
-    assert_eq!(n % 8, 0, "a packed matrix is whole fragments across");
-    for kt in 0..k_pad / 8 {
+fn pack_mma(w: &[f32], base: usize, k: usize, n: usize, out: &mut Vec<f32>) {
+    for kt in 0..k / 8 {
         for nt in 0..n / 8 {
             for lane in 0..32 {
                 let (g, t) = (lane / 4, lane % 4);
-                let at = |k: usize| {
-                    let row = 8 * kt + k;
-                    if row >= k_real {
-                        0.0
-                    } else {
-                        tf32(w[base + row * n + 8 * nt + g])
-                    }
-                };
-                out.push(at(t));
-                out.push(at(t + 4));
+                let at = |i: usize| tf32(w[base + (8 * kt + i) * n + 8 * nt + g]);
+                out.extend([at(t), at(t + 4)]);
             }
         }
     }
@@ -176,30 +168,11 @@ fn fragwise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
     let mut at = Vec::new();
     for blk in &l.blocks {
         for s in [blk.mix, blk.out] {
-            assert_eq!(s.o, C, "the trunk's matrices are the channel width across");
-            assert_eq!(s.i % 8, 0, "the trunk's matrices are whole fragments deep");
             at.push(out.len());
-            pack_mma(w, s.w, s.i, s.i, s.o, &mut out);
+            pack_mma(w, s.w, s.i, s.o, &mut out);
         }
     }
     (out, at)
-}
-
-fn join_pack(l: &NetLayout, w: &[f32]) -> Vec<f32> {
-    let mut out = Vec::new();
-    assert_eq!(l.join_b.i, JOIN_IN, "join_b is JOIN_IN deep");
-    assert_eq!(l.join_b.o, JW, "join_b is JW across");
-    pack_mma(w, l.join_b.w, l.join_b.i, JOIN_K, l.join_b.o, &mut out);
-    for s in l.join_w {
-        assert_eq!(s.i, JW, "a join residual is JW deep");
-        assert_eq!(s.o, JW, "a join residual is JW across");
-        pack_mma(w, s.w, s.i, s.i, s.o, &mut out);
-    }
-    let o = l.join_out;
-    assert_eq!(o.i, JW, "join_out is JW deep");
-    assert_eq!(o.o, D, "join_out is D across");
-    pack_mma(w, o.w, o.i, o.i, o.o, &mut out);
-    out
 }
 
 const TRUNK_ROWS: usize = N_HEXES.next_multiple_of(16);
@@ -208,26 +181,14 @@ const TRUNK_LDS: usize = C + 4;
 const TRUNK_SHARED: usize = (2 * N_HEXES + TRUNK_ROWS) * TRUNK_LDS * 4 + 3 * C * 4;
 const _: () = {
     assert!(C % 32 == 0, "k_trunk wants a whole number of warps a row");
-    assert!(TRUNK_ROWS % (C / 8) == 0, "k_trunk distributes whole hex rows");
+    assert!(
+        TRUNK_ROWS % (C / 8) == 0,
+        "k_trunk distributes whole hex rows"
+    );
 };
 
-fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
-    let mut out = Vec::with_capacity((JBLOCKS + 1) * JW + D);
-    let mut run = vec![0.0f32; JW];
-    for s in std::iter::once(l.join_b).chain(l.join_w) {
-        for (o, &x) in run.iter_mut().zip(&b[s.b..s.b + s.o]) {
-            *o += x;
-        }
-        out.extend_from_slice(&run);
-    }
-    out.extend_from_slice(&b[l.join_out.b..l.join_out.b + D]);
-    out
-}
-
 const TILE: usize = 16384;
-
-const JROWS: usize = 32;
-const _: () = assert!(JROWS <= JW && JROWS % 16 == 0);
+const ATTN_TILE: usize = 1024;
 
 struct Shard {
     call: usize,
@@ -463,13 +424,11 @@ struct Card {
     scratch: parking_lot::Mutex<Scratch>,
     w: CudaSlice<f32>,
     wt: CudaSlice<f32>,
-    jw: CudaSlice<f32>,
     b: CudaSlice<f32>,
     ln: CudaSlice<f32>,
     nb: CudaSlice<i32>,
     card_facts: CudaSlice<f32>,
     locations: CudaSlice<u8>,
-    owed: CudaSlice<f32>,
     plan: CudaSlice<i32>,
     layout: NetLayout,
 }
@@ -610,13 +569,10 @@ impl Device {
             card.stream.memcpy_htod(&flat.w, &mut card.w).map_err(err)?;
             let (lw, _) = fragwise(&card.layout, &flat.w);
             card.stream.memcpy_htod(&lw, &mut card.wt).map_err(err)?;
-            card.stream
-                .memcpy_htod(&join_pack(&card.layout, &flat.w), &mut card.jw)
-                .map_err(err)?;
             card.stream.memcpy_htod(&flat.b, &mut card.b).map_err(err)?;
-            card.stream.memcpy_htod(&flat.ln, &mut card.ln).map_err(err)?;
-            let owed = owed_by_the_join(&card.layout, &flat.b);
-            card.stream.memcpy_htod(&owed, &mut card.owed).map_err(err)?;
+            card.stream
+                .memcpy_htod(&flat.ln, &mut card.ln)
+                .map_err(err)?;
         }
         Ok(())
     }
@@ -637,15 +593,41 @@ impl Device {
         let _busy = c.busy.lock();
         c.stream.context().bind_to_thread().map_err(err)?;
         let g = c.solves.lock();
-        let s = g.get(solve).ok_or_else(|| format!("solve {solve} is not resident"))?;
+        let s = g
+            .get(solve)
+            .ok_or_else(|| format!("solve {solve} is not resident"))?;
         let mut h = c.down_f.lock();
         Ok(Resident {
-            p: s.ent[Ent::Board as usize].get_f32(&c.stream, B_P, 0, s.ent[Ent::Board as usize].len() * D, &mut h)?,
-            jp: s.ent[Ent::Board as usize].get_f32(&c.stream, B_JP, 0, s.ent[Ent::Board as usize].len() * JW, &mut h)?,
-            f: s.ent[Ent::Config as usize].get_f32(&c.stream, G_F, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
-            g: s.ent[Ent::Config as usize].get_f32(&c.stream, G_G, 0, s.ent[Ent::Config as usize].len() * POOL, &mut h)?,
-            fp: s.ent[Ent::Config as usize].get_f32(&c.stream, G_FP, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
-            prior: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_PRIOR, 0, s.ent[Ent::Cell as usize].len(), &mut h)?,
+            p: s.ent[Ent::Board as usize].get_f32(
+                &c.stream,
+                B_P,
+                0,
+                s.ent[Ent::Board as usize].len() * D,
+                &mut h,
+            )?,
+            query: s.ent[Ent::Config as usize].get_f32(
+                &c.stream,
+                G_QUERY,
+                0,
+                s.ent[Ent::Config as usize].len() * ATTN,
+                &mut h,
+            )?,
+            conditioned: c.stream.memcpy_dtov(
+                &s.conditioned.buf.as_ref().expect("conditioned cache").slice(0..s.conditioned.len)
+            ).map_err(err)?,
+            value_cfg: c.stream.memcpy_dtov(
+                &s.value_cfg.buf.as_ref().expect("value cache").slice(0..s.value_cfg.len)
+            ).map_err(err)?,
+            policy_cfg: c.stream.memcpy_dtov(
+                &s.policy_cfg.buf.as_ref().expect("policy cache").slice(0..s.policy_cfg.len)
+            ).map_err(err)?,
+            prior: s.ent[Ent::Cell as usize].get_f32(
+                &c.stream,
+                C_PRIOR,
+                0,
+                s.ent[Ent::Cell as usize].len(),
+                &mut h,
+            )?,
             cur: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_CUR, 0, s.ncells, &mut h)?,
             sum: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_SUM, 0, s.ncells, &mut h)?,
             qval: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_QVAL, 0, s.ncells, &mut h)?,
@@ -657,10 +639,10 @@ impl Device {
 
 pub struct Resident {
     pub p: Vec<f32>,
-    pub jp: Vec<f32>,
-    pub f: Vec<f32>,
-    pub g: Vec<f32>,
-    pub fp: Vec<f32>,
+    pub query: Vec<f32>,
+    pub conditioned: Vec<f32>,
+    pub value_cfg: Vec<f32>,
+    pub policy_cfg: Vec<f32>,
     pub prior: Vec<f32>,
     pub cur: Vec<f32>,
     pub sum: Vec<f32>,
@@ -686,22 +668,43 @@ macro_rules! defines {
 
 fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOptions {
     let mut options = defines![
-        ROW_BYTES, PUBFEAT, N_HEXES, HEX_CH, HEX_FACTS, HEX_BLOCK, NTYPE, NSLOT, PILE_COUNTS,
-        CARD_FEATS, OFF_PILES, OFF_CARDS, OFF_LOOSE, PLAYER_SCALARS, ROW_IDS, ROW_HEX_OWNER,
-        ROW_HEX_SLOT, ROW_HEX_HEIGHT, ROW_HEX_MARKER, ROW_PILES, ROW_HAND_SIZE, ROW_FD_SIZE,
-        ROW_BAG_SIZE, ROW_INITIATIVE, ROW_INIT_MOVED, ROW_TO_ACT, ROW_WP, ROW_STACK_KIND,
-        ROW_STACK_OWED, PENDING_KINDS, CONT_CAP, TRUNK_ROWS,
+        ROW_BYTES,
+        PUBFEAT,
+        N_HEXES,
+        HEX_CH,
+        HEX_FACTS,
+        HEX_BLOCK,
+        NTYPE,
+        NSLOT,
+        PILE_COUNTS,
+        CARD_FEATS,
+        OFF_PILES,
+        OFF_CARDS,
+        OFF_LOOSE,
+        PLAYER_SCALARS,
+        ROW_IDS,
+        ROW_HEX_OWNER,
+        ROW_HEX_SLOT,
+        ROW_HEX_HEIGHT,
+        ROW_HEX_MARKER,
+        ROW_PILES,
+        ROW_HAND_SIZE,
+        ROW_FD_SIZE,
+        ROW_BAG_SIZE,
+        ROW_INITIATIVE,
+        ROW_INIT_MOVED,
+        ROW_TO_ACT,
+        ROW_WP,
+        ROW_STACK_KIND,
+        ROW_STACK_OWED,
+        PENDING_KINDS,
+        CONT_CAP,
+        TRUNK_ROWS,
     ];
     options.extend([
         format!("--gpu-architecture=compute_{major}{minor}"),
         format!("-DTRUNK_MIN_BLOCKS={trunk_blocks}"),
         format!("-DTRUNK_C={C}"),
-        format!("-DJ_ROWS={JROWS}"),
-        format!("-DJ_W={JW}"),
-        format!("-DJ_IN={JOIN_K}"),
-        format!("-DJ_POOL={POOL}"),
-        format!("-DJ_D={D}"),
-        format!("-DJ_BLOCKS={JBLOCKS}"),
         format!("-DMAX_COINS={MAX_COINS:.1}f"),
     ]);
     CompileOptions {
@@ -855,30 +858,21 @@ impl Card {
         let mut plan: Vec<i32> = Vec::new();
         for (i, blk) in layout.blocks.iter().enumerate() {
             let (n0, n1) = (layout.norms[ln_block(i, 0)], layout.norms[ln_block(i, 1)]);
-            plan.extend([blk.mix.w, blk.mix.b, blk.pool.w, blk.pool.b, blk.out.w,
-                         blk.out.b, n0.g, n0.b, n1.g, n1.b].map(|x| x as i32));
+            plan.extend(
+                [
+                    blk.mix.w, blk.mix.b, blk.pool.w, blk.pool.b, blk.out.w, blk.out.b, n0.g, n0.b,
+                    n1.g, n1.b,
+                ]
+                .map(|x| x as i32),
+            );
             plan.extend([lanes[2 * i], lanes[2 * i + 1]].map(|x| x as i32));
         }
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
-        let owed = owed_by_the_join(&layout, &flat.b);
-        let mut at = layout.join_b.w + JOIN_IN * JW;
-        for span in layout.join_w {
-            assert_eq!(span.w, at, "the join's weights are not one run");
-            at += JW * JW;
-        }
-        assert_eq!(layout.join_out.w, at, "the join's weights are not one run");
-        for i in 0..=JBLOCKS {
-            let n = layout.norms[LN_JOIN + i];
-            assert_eq!(n.g, layout.norms[LN_JOIN].g + 2 * i * JW, "the join's norms are not one run");
-            assert_eq!(n.b, n.g + JW, "a join norm's shift does not follow its scale");
-        }
         Ok(Card {
             plan: stream.memcpy_stod(&plan).map_err(err)?,
-            owed: stream.memcpy_stod(&owed).map_err(err)?,
             w: stream.memcpy_stod(&flat.w).map_err(err)?,
             wt: stream.memcpy_stod(&fragwise).map_err(err)?,
-            jw: stream.memcpy_stod(&join_pack(&layout, &flat.w)).map_err(err)?,
             b: stream.memcpy_stod(&flat.b).map_err(err)?,
             ln: stream.memcpy_stod(&flat.ln).map_err(err)?,
             nb: stream.memcpy_stod(&nb).map_err(err)?,
@@ -1193,28 +1187,43 @@ impl Card {
         .map_err(err)
     }
 
-    fn trunk_tile(&self, calls: &[Call], mine: &[usize], sizes: &[usize], board0: usize, n: usize) -> Res<()> {
+    fn trunk_tile(
+        &self,
+        calls: &[Call],
+        mine: &[usize],
+        sizes: &[usize],
+        board0: usize,
+        n: usize,
+    ) -> Res<()> {
         self.encode_boards(n)?;
         let s = &self.stream;
         let mut sc = self.scratch.lock();
         sc.h.room(n * D)?;
-        sc.z.room(n * JW)?;
+        sc.z.room(n * ATTN)?;
         let Scratch { input, projected, x, h, z, .. } = &mut *sc;
         let p = h.buf.as_mut().unwrap();
-        let jp = z.buf.as_mut().unwrap();
-        self.run(self.layout.board_out, input.buf.as_ref().unwrap(), n, &mut *p)?;
-        self.run(self.layout.join_p, p, n, &mut *jp)?;
+        self.run(self.layout.board_out, input.buf.as_ref().unwrap(), n, p)?;
+        let value_board = Span {
+            w: self.layout.value_hidden.w + ATTN * ATTN,
+            b: usize::MAX,
+            i: D,
+            o: ATTN,
+        };
+        self.lin(value_board, p, n, 0.0, z.buf.as_mut().unwrap())?;
         let mut src = 0;
         let mut g = self.solves.lock();
         for w in shards(sizes, board0, n) {
-            let Call::Trunk { solve, boards_at, .. } = &calls[mine[w.call]] else {
+            let Call::Trunk {
+                solve, boards_at, ..
+            } = &calls[mine[w.call]]
+            else {
                 unreachable!("trunk shard holds only trunk calls")
             };
             self.slot(&mut g, *solve).copy_board(
                 s,
                 *boards_at + w.at,
                 p,
-                jp,
+                z.buf.as_ref().unwrap(),
                 projected.buf.as_ref().unwrap(),
                 x.buf.as_ref().unwrap(),
                 src,
@@ -1225,17 +1234,19 @@ impl Card {
         Ok(())
     }
 
-    fn keep(
-        &self,
-        calls: &[Call],
-        mine: &[usize],
-        pack: &mut Pack,
-    ) -> Res<()> {
+    fn keep(&self, calls: &[Call], mine: &[usize], pack: &mut Pack) -> Res<()> {
         let mut g = self.solves.lock();
         for &i in mine {
             let Call::Trunk {
-                solve, at: row0, queries: nrows, board_of, cidx, coff, ..
-            } = &calls[i] else {
+                solve,
+                at: row0,
+                queries: nrows,
+                board_of,
+                aidx,
+                coff,
+                ..
+            } = &calls[i]
+            else {
                 unreachable!("trunk shard holds only trunk calls")
             };
             let nrows = *nrows;
@@ -1247,127 +1258,203 @@ impl Card {
             let base = b.cells as u32;
             let shifted: Vec<u32> = coff.iter().map(|x| x + base).collect();
             b.host_coff.extend(shifted.iter().skip(1));
-            let words = pack.words(cidx);
-            let dst = b.view(&self.stream, Ent::Cidx, 0, b.cells, cidx.len(), 1)?;
-            pack.piece(dst, b.cells as u32, words, cidx.len() as u32);
+            let words = pack.words(aidx);
+            let dst = b.view(&self.stream, Ent::Cidx, I_AIDX, b.cells, aidx.len(), 1)?;
+            pack.piece(dst, b.cells as u32, words, aidx.len() as u32);
             let words = pack.words(&shifted);
             let dst = b.ent[Ent::Row as usize].field(Y_COFF, &self.stream);
             pack.piece(dst, 2 * *row0 as u32, words, shifted.len() as u32);
-            b.cells += cidx.len();
+            b.cells += aidx.len();
             b.rows = row0 + nrows;
         }
         Ok(())
     }
 
     fn configs(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
-        if mine.is_empty() {
-            return Ok(());
+        if mine.is_empty() { return Ok(()); }
+        let sizes: Vec<usize> = mine.iter().map(|&i| match &calls[i] {
+            Call::Configs { n, .. } => *n,
+            _ => unreachable!("config shard holds only config calls"),
+        }).collect();
+        let total: usize = sizes.iter().sum();
+        let mut phi = Vec::with_capacity(total * CFEAT);
+        let mut owner = Vec::with_capacity(total);
+        let mut cards = Vec::new();
+        let mut solves = Vec::with_capacity(mine.len());
+        for (part, &i) in mine.iter().enumerate() {
+            let Call::Configs { solve, phi: p, owner: o, cards: c, n, .. } = &calls[i] else { unreachable!() };
+            assert_eq!(p.len(), n * CFEAT);
+            assert_eq!(o.len(), *n);
+            assert_eq!(c.len(), NTYPE * TYPE);
+            assert!(o.iter().all(|&x| x < 2));
+            phi.extend_from_slice(p);
+            owner.extend(o.iter().map(|&x| x + 2 * part as u32));
+            cards.extend_from_slice(c);
+            solves.push(*solve);
         }
-        let each = |i: usize| -> (&[f32], &[u32], &[f32], usize) {
-            let Call::Configs { phi, owner, cards, n, .. } = &calls[i] else {
-                unreachable!("config shard holds only config calls")
-            };
-            assert_eq!(phi.len(), n * CFEAT, "config phi is not one row a config");
-            assert_eq!(owner.len(), *n, "config owner is not one entry a config");
-            (phi, owner, cards, *n)
-        };
-        let sizes: Vec<usize> = mine.iter().map(|&i| each(i).3).collect();
-        let n: usize = sizes.iter().sum();
-        let s = &self.stream;
-        let l = &self.layout;
-        {
-            let mut stage = self.host.lock();
-            stage.cfg_cards.put(s, mine.len() * NTYPE * TYPE, |dst| {
-                let mut at = 0;
-                for &i in mine {
-                    let (_, _, cd, _) = each(i);
-                    dst[at..at + cd.len()].copy_from_slice(cd);
-                    at += cd.len();
-                }
-                at
-            })?;
-            let views = stage.cfg_cards.host.len / (NTYPE * TYPE);
-            let cards = stage.cfg_cards.dev.buf.as_ref().expect("staged");
-            let mut sc = self.scratch.lock();
-            sc.bag.room(views * NTYPE * 3 * POOL)?;
-            self.run(l.cfg_m, cards, views * NTYPE, sc.bag.buf.as_mut().unwrap())?;
+        let stream = &self.stream;
+        let mut stage = self.host.lock();
+        stage.phi.put(stream, phi.len(), copy(&phi))?;
+        stage.owner.put(stream, owner.len(), copy(&owner))?;
+        stage.cfg_cards.put(stream, cards.len(), copy(&cards))?;
+        drop(stage);
+        for at in (0..total).step_by(TILE) {
+            let n = TILE.min(total - at);
+            self.config_tile(calls, mine, &sizes, at, n)?;
         }
-        let mut cfg0 = 0usize;
-        while cfg0 < n {
-            let k = TILE.min(n - cfg0);
-            {
-                let mut stage = self.host.lock();
-                let tile = shards(&sizes, cfg0, k);
-                stage.phi.put(s, k * CFEAT, |dst| {
-                    let mut wrote = 0;
-                    for w in &tile {
-                        let ph = each(mine[w.call]).0;
-                        let a = w.at * CFEAT;
-                        dst[wrote..wrote + w.len * CFEAT]
-                            .copy_from_slice(&ph[a..a + w.len * CFEAT]);
-                        wrote += w.len * CFEAT;
-                    }
-                    wrote
-                })?;
-                stage.owner.put(s, k, |dst| {
-                    let mut wrote = 0;
-                    for w in &tile {
-                        let ow = each(mine[w.call]).1;
-                        let base = (2 * w.call) as u32;
-                        for (d, &q) in dst[wrote..wrote + w.len].iter_mut().zip(&ow[w.at..w.at + w.len]) {
-                            *d = q + base;
-                        }
-                        wrote += w.len;
-                    }
-                    wrote
-                })?;
-            }
-            self.config_tile(calls, mine, &sizes, cfg0, k)?;
-            cfg0 += k;
+        let mut pairs = Vec::new();
+        for (part, &i) in mine.iter().enumerate() {
+            let Call::Configs { pair_at, pair_board, pair_config, .. } = &calls[i] else { unreachable!() };
+            assert_eq!(pair_board.len(), pair_config.len());
+            pairs.extend((0..pair_board.len()).map(|j| {
+                (part as u32, pair_at + j, pair_board[j], pair_config[j])
+            }));
+        }
+        self.lay(&solves)?;
+        for at in (0..pairs.len()).step_by(ATTN_TILE) {
+            let end = (at + ATTN_TILE).min(pairs.len());
+            self.attention_tile(&solves, &pairs[at..end])?;
         }
         Ok(())
     }
 
-    fn config_tile(&self, calls: &[Call], mine: &[usize], sizes: &[usize], cfg0: usize, k: usize) -> Res<()> {
-        let s = &self.stream;
+    fn config_tile(&self, calls: &[Call], mine: &[usize], sizes: &[usize], cfg0: usize, n: usize) -> Res<()> {
+        let stream = &self.stream;
         let stage = self.host.lock();
         let phi = stage.phi.dev.buf.as_ref().expect("staged");
         let owner = stage.owner.dev.buf.as_ref().expect("staged");
         let cards = stage.cfg_cards.dev.buf.as_ref().expect("staged");
-        let l = &self.layout;
-        let (n_i, nslot, cfeat) = (k as i32, NSLOT as i32, CFEAT as i32);
-        let (ntype, type_i, pool_i) = (NTYPE as i32, TYPE as i32, POOL as i32);
         let width = 3 + TYPE;
-        let mut sc = self.scratch.lock();
-        sc.tokens.room(k * NSLOT * width)?;
-        sc.projected.room(k * NSLOT * CFGH)?;
-        sc.facts.room(k * CFGH)?;
-        sc.h.room(k * D)?;
-        sc.pooled.room(k * POOL)?;
-        sc.z.room(k * D)?;
-        let Scratch { tokens, projected, facts, h, pooled, z, bag, .. } = &mut *sc;
-        carved!(tokens, projected, facts, h, pooled, z, bag);
-        let (slots, hidden, u) = (tokens, projected, facts);
-        let (f, g, fp) = (h, pooled, z);
-        launch!(self, cfg_slots, k * NSLOT * width, phi, owner, cards, &mut *slots, &n_i, &nslot, &cfeat, &ntype, &type_i)?;
-        self.run(l.cfg1, slots, k * NSLOT, &mut *hidden)?;
-        let hid = (k * NSLOT * CFGH) as i32;
-        launch!(self, gelu, k * NSLOT * CFGH, &mut *hidden, &hid)?;
-        let cfgh = CFGH as i32;
-        launch!(self, sum_slots, k * CFGH, hidden, &mut *u, &n_i, &nslot, &cfgh)?;
-        self.norm(l.norms[LN_CFG], k, true, &mut *u)?;
-        self.run(l.cfg_f, u, k, &mut *f)?;
-        self.run(l.cfg_g, u, k, &mut *g)?;
-        self.run(l.cfg_p, u, k, &mut *fp)?;
-        launch!(self, bag, k * POOL, bag, phi, owner, &mut *g, &n_i, &nslot, &ntype, &cfeat, &pool_i)?;
+        let mut scratch = self.scratch.lock();
+        scratch.tokens.room(n * NSLOT * width)?;
+        scratch.projected.room(n * NSLOT * ATTN)?;
+        scratch.facts.room(n * ATTN)?;
+        scratch.h.room(n * ATTN)?;
+        let Scratch { tokens, projected, facts, h, .. } = &mut *scratch;
+        carved!(tokens, projected, facts, h);
+        let phi = phi.slice(cfg0 * CFEAT..);
+        let owner = owner.slice(cfg0..);
+        let (n_i, nslot, cfeat) = (n as i32, NSLOT as i32, CFEAT as i32);
+        let (ntype, type_i, attn) = (NTYPE as i32, TYPE as i32, ATTN as i32);
+        launch!(self, cfg_slots, n * NSLOT * width, &phi, &owner, cards, &mut *tokens,
+                &n_i, &nslot, &cfeat, &ntype, &type_i)?;
+        self.run(self.layout.cfg_in, tokens, n * NSLOT, projected)?;
+        let hidden = (n * NSLOT * ATTN) as i32;
+        launch!(self, gelu, n * NSLOT * ATTN, &mut *projected, &hidden)?;
+        launch!(self, sum_slots, n * ATTN, &*projected, &mut *facts,
+                &n_i, &nslot, &attn)?;
+        let seat = self.w.slice(self.layout.cfg_seat..self.layout.cfg_seat + 2 * ATTN);
+        launch!(self, cfg_seat, n * ATTN, &mut *facts, &owner, &seat, &n_i, &attn)?;
+        self.norm(self.layout.norms[LN_CFG], n, true, facts)?;
+        self.run(self.layout.attn_q, facts, n, h)?;
         let mut src = 0;
         let mut solves = self.solves.lock();
-        for w in shards(sizes, cfg0, k) {
-            let Call::Configs { solve, at: base, .. } = &calls[mine[w.call]] else {
-                unreachable!("config shard holds only config calls")
-            };
-            self.slot(&mut solves, *solve).copy_cfg(s, *base + w.at, f, g, fp, src, w.len)?;
-            src += w.len;
+        for shard in shards(sizes, cfg0, n) {
+            let Call::Configs { solve, at, .. } = &calls[mine[shard.call]] else { unreachable!() };
+            self.slot(&mut solves, *solve).copy_cfg(
+                stream, *at + shard.at, facts, h, src, shard.len)?;
+            src += shard.len;
+        }
+        Ok(())
+    }
+
+    fn attention_tile(&self, solves: &[usize], pairs: &[(u32, usize, u32, u32)]) -> Res<()> {
+        let mut boards = Vec::new();
+        let mut board_map = HashMap::new();
+        let mut pair_board = Vec::with_capacity(pairs.len());
+        for &(part, _, board, _) in pairs {
+            let next = board_map.len() as u32;
+            let index = *board_map.entry((part, board)).or_insert_with(|| {
+                boards.push((part, board));
+                next
+            });
+            pair_board.push(index);
+        }
+        let stream = &self.stream;
+        let mut stage = self.host.lock();
+        stage.pair_part.put(stream, pairs.len(), |dst| {
+            for (out, pair) in dst.iter_mut().zip(pairs) { *out = pair.0; }
+            pairs.len()
+        })?;
+        stage.pair_board.put(stream, pairs.len(), copy(&pair_board))?;
+        stage.pair_config.put(stream, pairs.len(), |dst| {
+            for (out, pair) in dst.iter_mut().zip(pairs) { *out = pair.3; }
+            pairs.len()
+        })?;
+        stage.board_part.put(stream, boards.len(), |dst| {
+            for (out, board) in dst.iter_mut().zip(&boards) { *out = board.0; }
+            boards.len()
+        })?;
+        stage.board_local.put(stream, boards.len(), |dst| {
+            for (out, board) in dst.iter_mut().zip(&boards) { *out = board.1; }
+            boards.len()
+        })?;
+        let batch = self.batch.lock();
+        let mut scratch = self.scratch.lock();
+        let public_n = N_HEXES + NTYPE;
+        scratch.public.room(boards.len() * public_n * C)?;
+        scratch.encoded.room(boards.len() * public_n * ATTN)?;
+        scratch.queries.room(boards.len() * public_n * ATTN)?;
+        scratch.values.room(boards.len() * public_n * ATTN)?;
+        scratch.facts.room(pairs.len() * ATTN)?;
+        scratch.h.room(pairs.len() * ATTN)?;
+        scratch.z.room(pairs.len() * ATTN)?;
+        scratch.input.room(pairs.len() * D)?;
+        let Scratch { public, encoded, queries, values, facts, h, z, input, .. } = &mut *scratch;
+        carved!(public, encoded, queries, values, facts, h, z, input);
+        let part = stage.pair_part.dev.buf.as_ref().expect("staged");
+        let board = stage.pair_board.dev.buf.as_ref().expect("staged");
+        let config = stage.pair_config.dev.buf.as_ref().expect("staged");
+        let board_part = stage.board_part.dev.buf.as_ref().expect("staged");
+        let board_local = stage.board_local.dev.buf.as_ref().expect("staged");
+        let (nb, tokens, c) = (boards.len() as i32, public_n as i32, C as i32);
+        unsafe {
+            self.stream.launch_builder(&self.k.public_cache)
+                .arg(batch.trees.buf()).arg(board_part).arg(board_local).arg(&mut *public)
+                .arg(&nb).arg(&tokens).arg(&c)
+                .launch_unit(spread(boards.len() * public_n * C))
+        }.map_err(err)?;
+        self.run(self.layout.token_in, public, boards.len() * public_n, encoded)?;
+        self.run(self.layout.attn_k, encoded, boards.len() * public_n, queries)?;
+        self.run(self.layout.attn_v, encoded, boards.len() * public_n, values)?;
+        let (n, attn, heads) = (pairs.len() as i32, ATTN as i32, HEADS as i32);
+        unsafe {
+            self.stream.launch_builder(&self.k.attention)
+                .arg(batch.trees.buf()).arg(&*queries).arg(&*values)
+                .arg(part).arg(board).arg(config).arg(&mut *facts)
+                .arg(&n).arg(&tokens).arg(&attn).arg(&heads)
+                .launch_unit(LaunchConfig {
+                    grid_dim: (pairs.len() as u32, HEADS as u32, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: (public_n * 4) as u32,
+                })
+        }.map_err(err)?;
+        self.run(self.layout.attn_out, facts, pairs.len(), h)?;
+        let norm = self.layout.norms[LN_ATTN];
+        let gamma = self.ln.slice(norm.g..norm.g + ATTN);
+        let beta = self.ln.slice(norm.b..norm.b + ATTN);
+        unsafe {
+            self.stream.launch_builder(&self.k.attention_residual)
+                .arg(batch.trees.buf()).arg(&mut *h).arg(part).arg(config)
+                .arg(&gamma).arg(&beta).arg(&n).arg(&attn)
+                .launch_unit(warp_rows(pairs.len()))
+        }.map_err(err)?;
+        let value_cfg = Span { w: self.layout.value_hidden.w, b: usize::MAX, i: ATTN, o: ATTN };
+        let policy_cfg = Span { w: self.layout.cfg_policy.w, b: usize::MAX, i: ATTN, o: D };
+        self.lin(value_cfg, h, pairs.len(), 0.0, z)?;
+        self.lin(policy_cfg, h, pairs.len(), 0.0, input)?;
+        let mut from = 0;
+        let mut resident = self.solves.lock();
+        while from < pairs.len() {
+            let part = pairs[from].0 as usize;
+            let mut end = from + 1;
+            while end < pairs.len() && pairs[end].0 as usize == part
+                && pairs[end].1 == pairs[from].1 + end - from {
+                end += 1;
+            }
+            self.slot(&mut resident, solves[part]).copy_pairs(
+                stream, pairs[from].1, h, z, input, from, end - from)?;
+            from = end;
         }
         Ok(())
     }
@@ -1466,31 +1553,61 @@ impl Card {
         let desc_d = at(6 * m + na, crate::search::ACT_BYTES * na);
         let cells_d = at(6 * m + (1 + crate::search::ACT_BYTES) * na, ncells);
         let l = &self.layout;
-        let (na_i, m_i, d_i, aw_i) = (na as i32, m as i32, D as i32, AW as i32);
-        let (ntype, nhex, chan) = (NTYPE as i32, N_HEXES as i32, C as i32);
+        let (na_i, m_i, d_i, c_i, attn_i) = (na as i32, m as i32, D as i32, C as i32, ATTN as i32);
+        let (ntype, nhex) = (NTYPE as i32, N_HEXES as i32);
         let mut sc = self.scratch.lock();
-        sc.action.room(na * AW)?;
+        sc.action.room(na * C)?;
         sc.h.room((m * D).max(na * D))?;
-        sc.facts.room(m * AW)?;
-        sc.input.room(m * JOIN_IN)?;
-        sc.z.room(m * JW)?;
-        sc.pooled.room((m * JW).max(m * AW))?;
-        let Scratch { action, h, input, z: join_z, pooled, facts, .. } = &mut *sc;
-        carved!(action, h, facts, input, join_z, pooled);
-        let (action_z, hbuf, board_proj) = (action, h, facts);
-        let (join_in, temp) = (input, pooled);
-        let kind = self.w.slice(l.act_kind..l.act_kind + crate::actions::N_KINDS * AW);
-        let role = self.w.slice(l.act_role..l.act_role + 5 * AW);
-        launch!(self, act_feats, na * AW, batch.trees.buf(), &part_d, &row_d,
-                &desc_d, &act_node_d, &kind, &role, &mut *action_z,
-                &na_i, &ntype, &nhex, &chan)?;
-        let (pool_i, jw_i) = (POOL as i32, JW as i32);
+        sc.facts.room(m * D)?;
+        sc.input.room(m * (D + 2 * ATTN))?;
+        sc.queries.room(m * 2 * ATTN)?;
+        sc.z.room(m * C)?;
+        sc.pooled.room(m * C)?;
+        let Scratch {
+            action,
+            h,
+            input,
+            queries,
+            z,
+            pooled,
+            facts,
+            ..
+        } = &mut *sc;
+        carved!(action, h, input, queries, z, pooled, facts);
+        let kind = self
+            .w
+            .slice(l.act_kind..l.act_kind + crate::actions::N_KINDS * C);
+        let role = self.w.slice(l.act_role..l.act_role + 5 * C);
+        launch!(
+            self,
+            act_feats,
+            na * C,
+            batch.trees.buf(),
+            &part_d,
+            &row_d,
+            &desc_d,
+            &act_node_d,
+            &kind,
+            &role,
+            &mut *action,
+            &na_i,
+            &ntype,
+            &nhex,
+            &c_i
+        )?;
         unsafe {
             self.stream
-                .launch_builder(&self.k.prior_inputs)
-                .arg(batch.trees.buf()).arg(&part_d).arg(&node_d).arg(&row_d)
-                .arg(&mut *join_in).arg(&mut *hbuf).arg(&mut *join_z)
-                .arg(&m_i).arg(&pool_i).arg(&d_i).arg(&jw_i)
+                .launch_builder(&self.k.policy_inputs)
+                .arg(batch.trees.buf())
+                .arg(&part_d)
+                .arg(&node_d)
+                .arg(&row_d)
+                .arg(&mut *input)
+                .arg(&mut *queries)
+                .arg(&mut *facts)
+                .arg(&m_i)
+                .arg(&attn_i)
+                .arg(&d_i)
                 .launch_unit(LaunchConfig {
                     grid_dim: (m as u32, 1, 1),
                     block_dim: (32, 1, 1),
@@ -1498,31 +1615,38 @@ impl Card {
                 })
         }
         .map_err(err)?;
-        self.run(l.act_board, hbuf, m, &mut *board_proj)?;
-        self.lin(l.join_b, join_in, m, 1.0, join_z)?;
-        self.bias(l.join_b, m, join_z)?;
-        for i in 0..JBLOCKS {
-            let src = join_z.slice(0..m * JW);
-            let mut dst = temp.slice_mut(0..m * JW);
-            self.stream.memcpy_dtod(&src, &mut dst).map_err(err)?;
-            self.norm(l.norms[LN_JOIN + i], m, true, temp)?;
-            self.lin(l.join_w[i], temp, m, 1.0, join_z)?;
-            self.bias(l.join_w[i], m, join_z)?;
-        }
-        {
-            let src = join_z.slice(0..m * JW);
-            let mut dst = temp.slice_mut(0..m * JW);
-            self.stream.memcpy_dtod(&src, &mut dst).map_err(err)?;
-        }
-        self.norm(l.norms[LN_JOUT], m, true, temp)?;
-        self.lin(l.join_out, temp, m, 1.0, hbuf)?;
-        self.bias(l.join_out, m, hbuf)?;
-        self.norm(l.norms[LN_H], m, false, hbuf)?;
-        self.run(l.act_h, hbuf, m, &mut *temp)?;
-        launch!(self, act_add, na * AW, &mut *action_z, board_proj, &act_node_d, &na_i, &aw_i)?;
-        launch!(self, act_add, na * AW, &mut *action_z, temp, &act_node_d, &na_i, &aw_i)?;
-        self.norm(l.norms[LN_ACT], na, true, &mut *action_z)?;
-        self.run(l.act_out, action_z, na, &mut *hbuf)?;
+        self.run(l.act_board, facts, m, pooled)?;
+        self.run(l.head_policy, input, m, h)?;
+        self.run(l.act_h, h, m, z)?;
+        let policy_belief = Span {
+            w: l.cfg_policy.w + ATTN * D,
+            b: usize::MAX,
+            i: 2 * ATTN,
+            o: D,
+        };
+        self.lin(policy_belief, queries, m, 0.0, facts)?;
+        launch!(
+            self,
+            act_add,
+            na * C,
+            &mut *action,
+            &*pooled,
+            &act_node_d,
+            &na_i,
+            &c_i
+        )?;
+        launch!(
+            self,
+            act_add,
+            na * C,
+            &mut *action,
+            &*z,
+            &act_node_d,
+            &na_i,
+            &c_i
+        )?;
+        self.norm(l.norms[LN_ACT], na, true, action)?;
+        self.run(l.act_out, action, na, h)?;
         const WARPS: u32 = 4;
         let cfg = LaunchConfig {
             grid_dim: (widest.div_ceil(WARPS).max(1), m as u32, 1),
@@ -1532,9 +1656,19 @@ impl Card {
         unsafe {
             self.stream
                 .launch_builder(&self.k.prior)
-                .arg(batch.trees.buf()).arg(&part_d).arg(&node_d).arg(&row_d)
-                .arg(&act_at_d).arg(&cell_at_d).arg(&cells_d).arg(&*hbuf)
-                .arg(&inv_d).arg(&m_i).arg(&d_i)
+                .arg(batch.trees.buf())
+                .arg(&part_d)
+                .arg(&node_d)
+                .arg(&row_d)
+                .arg(&act_at_d)
+                .arg(&cell_at_d)
+                .arg(&cells_d)
+                .arg(&*h)
+                .arg(&*facts)
+                .arg(&self.b.slice(l.cfg_policy.b..l.cfg_policy.b + D))
+                .arg(&inv_d)
+                .arg(&m_i)
+                .arg(&d_i)
                 .launch_unit(cfg)
         }
         .map_err(err)
@@ -1916,38 +2050,52 @@ impl Card {
     }
 
     fn opinions(&self, b: &Batch, p: &Prefix) -> Res<()> {
-        let (trees, part_d, local_d, base_d, coff_d) =
-            (b.trees.buf(), b.part.buf(), b.local.buf(), b.base.buf(), b.coff.buf());
+        let (trees, part, local) = (b.trees.buf(), b.part.buf(), b.local.buf());
         let stride = p.rows;
         let l = &self.layout;
         let tile = TILE.min(stride);
-
-        let ln = l.norms[LN_JOIN];
-        let join_ln = self.ln.slice(ln.g..ln.g + 2 * (JBLOCKS + 1) * JW);
+        let belief_span = Span {
+            w: l.value_hidden.w + (ATTN + D) * ATTN,
+            b: usize::MAX,
+            i: 2 * ATTN,
+            o: ATTN,
+        };
+        let hidden_b = self.b.slice(l.value_hidden.b..l.value_hidden.b + ATTN);
+        let out_w = self.w.slice(l.value_out.w..l.value_out.w + ATTN);
+        let out_b = self.b.slice(l.value_out.b..l.value_out.b + 1);
         let mut q0 = 0usize;
         while q0 < stride {
             let n = tile.min(stride - q0);
             let q0_i = q0 as i32;
             let rows = 2 * n;
             let rows_i = rows as i32;
-            let bias = self.b.slice(l.value_bias..l.value_bias + 1);
-            let hn = l.norms[LN_H];
-            let g = self.ln.slice(hn.g..hn.g + hn.width);
-            let hb = self.ln.slice(hn.b..hn.b + hn.width);
+            let mut scratch = self.scratch.lock();
+            scratch.input.room(rows * 2 * ATTN)?;
+            scratch.h.room(rows * ATTN)?;
+            let Scratch { input, h, .. } = &mut *scratch;
+            carved!(input, h);
             unsafe {
-                    self.stream
-                        .launch_builder(&self.k.leaf)
-                        .arg(trees).arg(part_d).arg(local_d).arg(base_d).arg(coff_d)
-                        .arg(&self.jw).arg(&join_ln).arg(&self.owed)
-                        .arg(&bias).arg(&g).arg(&hb)
-                        .arg(&rows_i).arg(&q0_i)
-                        .launch_unit(LaunchConfig {
-                            grid_dim: ((rows as u32).div_ceil(JROWS as u32), 1, 1),
-                            block_dim: (32, (JW / 8) as u32, 1),
-                            shared_mem_bytes: 0,
-                        })
-                }
-            .map_err(err)?;
+                self.stream.launch_builder(&self.k.belief)
+                    .arg(trees).arg(part).arg(local).arg(&mut *input)
+                    .arg(&rows_i).arg(&q0_i).arg(&(ATTN as i32))
+                    .launch_unit(LaunchConfig {
+                        grid_dim: (rows as u32, 2, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }.map_err(err)?;
+            self.lin(belief_span, input, rows, 0.0, h)?;
+            unsafe {
+                self.stream.launch_builder(&self.k.value)
+                    .arg(trees).arg(part).arg(local).arg(&*h)
+                    .arg(&hidden_b).arg(&out_w).arg(&out_b)
+                    .arg(&rows_i).arg(&q0_i).arg(&(ATTN as i32))
+                    .launch_unit(LaunchConfig {
+                        grid_dim: (rows as u32, 1, 1),
+                        block_dim: (ATTN as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }.map_err(err)?;
             q0 += n;
         }
         Ok(())
@@ -2029,6 +2177,11 @@ struct Stage {
     card_of_row: Wire<i32>,
     phi: Wire<f32>,
     owner: Wire<u32>,
+    pair_part: Wire<u32>,
+    pair_board: Wire<u32>,
+    pair_config: Wire<u32>,
+    board_part: Wire<u32>,
+    board_local: Wire<u32>,
     cfg_cards: Wire<f32>,
     blob: Wire<u32>,
     dst: Wire<u64>,
@@ -2045,6 +2198,9 @@ struct Scratch {
     input: Arr<f32>,
     leaves: Arr<u32>,
     queries: Arr<f32>,
+    public: Arr<f32>,
+    encoded: Arr<f32>,
+    values: Arr<f32>,
     piles: Arr<f32>,
     tokens: Arr<f32>,
     projected: Arr<f32>,
@@ -2055,7 +2211,6 @@ struct Scratch {
     occupant: Arr<i32>,
     x: Arr<f32>,
     action: Arr<f32>,
-    bag: Arr<f32>,
 }
 
 struct Plan {
@@ -2090,6 +2245,7 @@ impl Plan {
         let b = &cfg.budget;
         let (nodes, rows, cidx) = (b.cap(Ent::Node), b.cap(Ent::Row), b.cap(Ent::Cidx));
         let cards = n * NTYPE * TYPE;
+        let configs = n * b.cap(Ent::Config);
         let resident = FIELDS[0] * nodes
             + FIELDS[1] * b.cap(Ent::Cell)
             + FIELDS[2] * b.cap(Ent::Reach)
@@ -2098,12 +2254,15 @@ impl Plan {
             + 2 * b.cap(Ent::Config)
             + cidx;
         let scratch = Scratch {
-            pooled: self.arr(2 * TILE * POOL)?,
+            pooled: self.arr(TILE * C)?,
             h: self.arr(2 * TILE * D)?,
             z: self.arr(TILE * D)?,
-            input: self.arr(TILE * (2 * C + LOOSE))?,
+            input: self.arr(TILE * (D + 2 * ATTN))?,
             leaves: self.arr(n * cfg.s.max(1) as usize)?,
-            queries: self.arr(n * b.cap(Ent::Config))?,
+            queries: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * ATTN)?,
+            public: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * C)?,
+            encoded: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * ATTN)?,
+            values: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * ATTN)?,
             piles: self.arr(TILE * NTYPE * PILE_COUNTS)?,
             tokens: self.arr(TILE * NTYPE * TYPE)?,
             projected: self.arr(TILE * NTYPE * C)?,
@@ -2113,16 +2272,20 @@ impl Plan {
             facts: self.arr(TILE * N_HEXES * HEX_FACTS)?,
             occupant: self.arr(TILE * N_HEXES)?,
             x: self.arr(TILE * N_HEXES * C)?,
-            action: self.arr(TILE * AW)?,
-            bag: self.arr(n * NTYPE * 3 * POOL)?,
+            action: self.arr(TILE * C)?,
         };
         let stage = Stage {
             packed: self.wire(TILE * ROW_BYTES)?,
             xpub: self.arr(TILE * PUBFEAT)?,
             cards: self.wire(cards)?,
             card_of_row: self.wire(TILE)?,
-            phi: self.wire(TILE * CFEAT)?,
-            owner: self.wire(TILE)?,
+            phi: self.wire(configs * CFEAT)?,
+            owner: self.wire(configs)?,
+            pair_part: self.wire(ATTN_TILE)?,
+            pair_board: self.wire(ATTN_TILE)?,
+            pair_config: self.wire(ATTN_TILE)?,
+            board_part: self.wire(ATTN_TILE)?,
+            board_local: self.wire(ATTN_TILE)?,
             cfg_cards: self.wire(cards)?,
             blob: self.wire(n * (resident + rows + cidx + 2 * rows + 1))?,
             dst: self.wire(TILE)?,

@@ -5,7 +5,7 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
 use crate::board::N_HEXES;
 use crate::contract::Dst;
-use crate::net::{C, D, JW, POOL};
+use crate::net::{ATTN, C, D};
 use crate::pbs::NTYPE;
 use crate::search::{Budget, Ent};
 
@@ -28,15 +28,17 @@ pub fn tree_source() -> String {
     for c in &TABLE {
         out += &format!("    {} {};\n", c.ty, c.name);
     }
-    for tail in ["unsigned long long* seed", "unsigned long long nterm",
-                 "unsigned long long nvals", "unsigned long long step",
-                 "unsigned long long todo", "unsigned long long nexpand"] {
+    for tail in ["const float* conditioned", "const float* value_cfg",
+                 "const float* policy_cfg", "unsigned long long* seed",
+                 "unsigned long long nterm", "unsigned long long nvals",
+                 "unsigned long long step", "unsigned long long todo",
+                 "unsigned long long nexpand"] {
         out += &format!("    {tail};\n");
     }
     out + "};\n"
 }
 
-const TABLE: [Col; 54] = [
+const TABLE: [Col; 53] = [
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Kind), name: "kind", ty: CU },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Player), name: "player", ty: CU },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Exhausted), name: "exhausted", ty: CU },
@@ -80,20 +82,19 @@ const TABLE: [Col; 54] = [
     Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Prior), name: "prior", ty: FM },
     Col { ent: Ent::Cell, width: 0, dst: None, name: "avg", ty: FM },
     Col { ent: Ent::Board, width: D, dst: None, name: "p", ty: CF },
-    Col { ent: Ent::Board, width: JW, dst: None, name: "jp", ty: CF },
+    Col { ent: Ent::Board, width: ATTN, dst: None, name: "value_board", ty: CF },
     Col { ent: Ent::Board, width: NTYPE * C, dst: None, name: "tokens", ty: CF },
     Col { ent: Ent::Board, width: N_HEXES * C, dst: None, name: "spatial", ty: CF },
     Col { ent: Ent::Row, width: 1, dst: None, name: "board_of", ty: CU },
-    Col { ent: Ent::Config, width: D, dst: None, name: "f", ty: CF },
-    Col { ent: Ent::Config, width: POOL, dst: None, name: "g", ty: CF },
-    Col { ent: Ent::Config, width: D, dst: None, name: "fp", ty: CF },
-    Col { ent: Ent::Cidx, width: 1, dst: None, name: "cidx", ty: CU },
+    Col { ent: Ent::Config, width: ATTN, dst: None, name: "query", ty: CF },
+    Col { ent: Ent::Config, width: ATTN, dst: None, name: "attn_query", ty: CF },
+    Col { ent: Ent::Cidx, width: 1, dst: None, name: "aidx", ty: CU },
     Col { ent: Ent::Row, width: 2, dst: None, name: "coff", ty: CU },
     Col { ent: Ent::Row, width: 1, dst: Some(Dst::LeafNode), name: "leaf_node", ty: CU },
     Col { ent: Ent::Row, width: 1, dst: Some(Dst::Term), name: "term", ty: CU },
 ];
 
-pub const DESC: usize = TABLE.len() + 6;
+pub const DESC: usize = TABLE.len() + 9;
 
 const fn fields() -> [usize; 8] {
     let mut f = [0; 8];
@@ -144,13 +145,13 @@ pub const C_PRIOR: usize = lane(Ent::Cell, "prior");
 pub const R_REACH: usize = lane(Ent::Reach, "reach");
 pub const R_VALS: usize = lane(Ent::Reach, "vals");
 pub const B_P: usize = lane(Ent::Board, "p");
-pub const B_JP: usize = lane(Ent::Board, "jp");
+pub const B_VALUE_BOARD: usize = lane(Ent::Board, "value_board");
 pub const B_TOKENS: usize = lane(Ent::Board, "tokens");
 pub const B_SPATIAL: usize = lane(Ent::Board, "spatial");
-pub const G_F: usize = lane(Ent::Config, "f");
-pub const G_G: usize = lane(Ent::Config, "g");
-pub const G_FP: usize = lane(Ent::Config, "fp");
+pub const G_QUERY: usize = lane(Ent::Config, "query");
+pub const G_ATTN_QUERY: usize = lane(Ent::Config, "attn_query");
 pub const Y_BOARD_OF: usize = lane(Ent::Row, "board_of");
+pub const I_AIDX: usize = lane(Ent::Cidx, "aidx");
 pub const Y_COFF: usize = lane(Ent::Row, "coff");
 
 const _: () = {
@@ -159,13 +160,12 @@ const _: () = {
     assert!(FIELDS[2] == 9);
     assert!(FIELDS[3] == 4);
     assert!(FIELDS[4] == 5);
-    assert!(FIELDS[5] == D + JW + NTYPE * C + N_HEXES * C);
-    assert!(FIELDS[6] == 2 * D + POOL);
+    assert!(FIELDS[5] == D + ATTN + NTYPE * C + N_HEXES * C);
+    assert!(FIELDS[6] == 2 * ATTN);
     assert!(FIELDS[7] == 1);
     assert!(C_CUR == 7 && C_SUM == 9 && C_PRIOR == 12);
-    assert!(B_P == 0 && B_JP == D);
-    assert!(B_TOKENS == D + JW && B_SPATIAL == D + JW + NTYPE * C);
-    assert!(G_F == 0 && Y_COFF == 1);
+    assert!(B_P == 0 && B_VALUE_BOARD == D);
+    assert!(G_QUERY == 0 && Y_COFF == 1);
 };
 
 fn dst_slot(d: Dst) -> (Ent, usize, usize) {
@@ -214,6 +214,23 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         stream.memcpy_htod(host, &mut d).map_err(err)
     }
 
+    pub fn put_dtod(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        at: usize,
+        src: &CudaSlice<T>,
+        from: usize,
+        n: usize,
+    ) -> Res<()> {
+        if at + n > self.cap {
+            return Err(format!("scratch grew past its slot: {} > {}", at + n, self.cap));
+        }
+        self.len = self.len.max(at + n);
+        if n == 0 { return Ok(()); }
+        let dst = self.buf.as_mut().expect("a capacity implies a buffer");
+        stream.memcpy_dtod(&src.slice(from..from + n), &mut dst.slice_mut(at..at + n)).map_err(err)
+    }
+
     pub fn room(&mut self, want: usize) -> Res<&mut CudaSlice<T>> {
         if want > self.cap {
             return Err(format!("scratch grew past its slot: {want} > {}", self.cap));
@@ -228,8 +245,8 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
 }
 
 pub struct Entity {
-    arr: Arr<u32>,
-    stride: usize,
+    pub arr: Arr<u32>,
+    pub stride: usize,
     limit: usize,
     nfields: usize,
     len: usize,
@@ -348,6 +365,9 @@ pub struct Solve {
     pub ncells: usize,
     pub nreach: usize,
     pub level_start: Vec<u32>,
+    pub conditioned: Arr<f32>,
+    pub value_cfg: Arr<f32>,
+    pub policy_cfg: Arr<f32>,
     pub seed: Arr<u64>,
     pub step: usize,
     pub todo: usize,
@@ -383,6 +403,9 @@ impl Solve {
             ncells: 0,
             nreach: 0,
             level_start: Vec::new(),
+            conditioned: Arr::with_cap(s, b.cap(Ent::Cidx) * ATTN)?,
+            value_cfg: Arr::with_cap(s, b.cap(Ent::Cidx) * ATTN)?,
+            policy_cfg: Arr::with_cap(s, b.cap(Ent::Cidx) * D)?,
             seed: Arr::with_cap(s, 1)?,
             step: 0,
             todo: 0,
@@ -408,6 +431,9 @@ impl Solve {
         self.ent[Ent::Board as usize].rewind();
         self.ent[Ent::Config as usize].rewind();
         self.ent[Ent::Cidx as usize].rewind();
+        self.conditioned.len = 0;
+        self.value_cfg.len = 0;
+        self.policy_cfg.len = 0;
         self.nterm = 0;
         self.nvals = 0;
         self.ncells = 0;
@@ -424,7 +450,9 @@ impl Solve {
     }
 
     pub fn bytes(&self) -> usize {
-        self.ent.iter().map(Entity::bytes).sum::<usize>() + self.seed.cap * 8
+        self.ent.iter().map(Entity::bytes).sum::<usize>()
+            + (self.conditioned.cap + self.value_cfg.cap + self.policy_cfg.cap) * 4
+            + self.seed.cap * 8
     }
 
     pub fn copy_board(
@@ -432,7 +460,7 @@ impl Solve {
         s: &Arc<CudaStream>,
         at: usize,
         p: &CudaSlice<f32>,
-        jp: &CudaSlice<f32>,
+        value_board: &CudaSlice<f32>,
         tokens: &CudaSlice<f32>,
         spatial: &CudaSlice<f32>,
         from: usize,
@@ -441,7 +469,7 @@ impl Solve {
         self.reserve(Ent::Board, at + n)?;
         let e = &mut self.ent[Ent::Board as usize];
         e.copy_f32(s, B_P, at * D, p, from * D, n * D)?;
-        e.copy_f32(s, B_JP, at * JW, jp, from * JW, n * JW)?;
+        e.copy_f32(s, B_VALUE_BOARD, at * ATTN, value_board, from * ATTN, n * ATTN)?;
         e.copy_f32(s, B_TOKENS, at * NTYPE * C, tokens, from * NTYPE * C, n * NTYPE * C)?;
         e.copy_f32(s, B_SPATIAL, at * N_HEXES * C, spatial, from * N_HEXES * C, n * N_HEXES * C)
     }
@@ -450,17 +478,33 @@ impl Solve {
         &mut self,
         s: &Arc<CudaStream>,
         at: usize,
-        f: &CudaSlice<f32>,
-        g: &CudaSlice<f32>,
-        fp: &CudaSlice<f32>,
+        query: &CudaSlice<f32>,
+        attn_query: &CudaSlice<f32>,
         from: usize,
         n: usize,
     ) -> Res<()> {
         self.reserve(Ent::Config, at + n)?;
         let e = &mut self.ent[Ent::Config as usize];
-        e.copy_f32(s, G_F, at * D, f, from * D, n * D)?;
-        e.copy_f32(s, G_G, at * POOL, g, from * POOL, n * POOL)?;
-        e.copy_f32(s, G_FP, at * D, fp, from * D, n * D)
+        e.copy_f32(s, G_QUERY, at * ATTN, query, from * ATTN, n * ATTN)?;
+        e.copy_f32(s, G_ATTN_QUERY, at * ATTN, attn_query, from * ATTN, n * ATTN)
+    }
+
+    pub fn copy_pairs(
+        &mut self,
+        s: &Arc<CudaStream>,
+        at: usize,
+        conditioned: &CudaSlice<f32>,
+        value_cfg: &CudaSlice<f32>,
+        policy_cfg: &CudaSlice<f32>,
+        from: usize,
+        n: usize,
+    ) -> Res<()> {
+        let copy = |dst: &mut Arr<f32>, width, src: &CudaSlice<f32>| -> Res<()> {
+            dst.put_dtod(s, at * width, src, from * width, n * width)
+        };
+        copy(&mut self.conditioned, ATTN, conditioned)?;
+        copy(&mut self.value_cfg, ATTN, value_cfg)?;
+        copy(&mut self.policy_cfg, D, policy_cfg)
     }
 
     pub fn view(&mut self, s: &Arc<CudaStream>, e: Ent, field: usize, at: usize, n: usize, width: usize) -> Res<u64> {
@@ -487,12 +531,15 @@ impl Solve {
             acc[e] += c.width;
             i += 1;
         }
-        out[i] = self.seed.ptr(s);
-        out[i + 1] = self.nterm as u64;
-        out[i + 2] = self.nvals as u64;
-        out[i + 3] = self.step as u64;
-        out[i + 4] = self.todo as u64;
-        out[i + 5] = self.nexpand as u64;
+        out[i] = self.conditioned.ptr(s);
+        out[i + 1] = self.value_cfg.ptr(s);
+        out[i + 2] = self.policy_cfg.ptr(s);
+        out[i + 3] = self.seed.ptr(s);
+        out[i + 4] = self.nterm as u64;
+        out[i + 5] = self.nvals as u64;
+        out[i + 6] = self.step as u64;
+        out[i + 7] = self.todo as u64;
+        out[i + 8] = self.nexpand as u64;
         out
     }
 }

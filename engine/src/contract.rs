@@ -11,7 +11,7 @@ pub enum Call {
         boards: usize,
         packed: Vec<u8>,
         cards: Vec<f32>,
-        cidx: Vec<u32>,
+        aidx: Vec<u32>,
         coff: Vec<u32>,
     },
     Configs {
@@ -21,6 +21,9 @@ pub enum Call {
         owner: Vec<u32>,
         cards: Vec<f32>,
         n: usize,
+        pair_at: usize,
+        pair_board: Vec<u32>,
+        pair_config: Vec<u32>,
     },
     Tree {
         solve: usize,

@@ -1,4 +1,3 @@
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,7 +12,6 @@ HEX_CH = warchest.HEX_CH
 HEX_FACTS = warchest.HEX_FACTS
 PILE_COUNTS = warchest.PILE_COUNTS
 CARD_FEATS = warchest.CARD_FEATS
-CCOUNTS = warchest.CCOUNTS
 OFF_PILES = warchest.OFF_PILES
 OFF_CARDS = warchest.OFF_CARDS
 OFF_LOOSE = warchest.OFF_LOOSE
@@ -23,14 +21,10 @@ TYPE = 64
 C = 96
 BLOCKS = 8
 D = 256
-POOL = 64
-CFGH = 128
-JW = 128
-JBLOCKS = 3
+ATTN = 128
+HEADS = 4
+HEAD = ATTN // HEADS
 N_KINDS = warchest.N_KINDS
-ACT_BYTES = warchest.ACT_BYTES
-
-JOIN_IN = 2 * POOL + 1
 
 
 def gelu(x):
@@ -57,41 +51,37 @@ class Net(nn.Module):
         self.ln1 = nn.ModuleList([nn.LayerNorm(C) for _ in range(BLOCKS)])
         self.ln2 = nn.ModuleList([nn.LayerNorm(C) for _ in range(BLOCKS)])
         self.ln_trunk = nn.LayerNorm(C)
-
         self.board_out = nn.Linear(2 * C + LOOSE, D)
 
-        self.cfg1 = nn.Linear(3 + TYPE, CFGH)
-        self.ln_cfg = nn.LayerNorm(CFGH)
-        self.cfg_f = nn.Linear(CFGH, D)
-        self.cfg_g = nn.Linear(CFGH, POOL)
-        self.cfg_m = nn.Linear(TYPE, 3 * POOL, bias=False)
-        self.cfg_p = nn.Linear(CFGH, D)
+        self.cfg_in = nn.Linear(3 + TYPE, ATTN)
+        self.cfg_seat = nn.Embedding(2, ATTN)
+        self.ln_cfg = nn.LayerNorm(ATTN)
+        self.token_in = nn.Linear(C, ATTN)
+        self.attn_q = nn.Linear(ATTN, ATTN, bias=False)
+        self.attn_k = nn.Linear(ATTN, ATTN, bias=False)
+        self.attn_v = nn.Linear(ATTN, ATTN, bias=False)
+        self.attn_out = nn.Linear(ATTN, ATTN, bias=False)
+        self.ln_attn = nn.LayerNorm(ATTN)
+
+        context = 3 * ATTN + D
+        self.value_hidden = nn.Linear(context, ATTN)
+        self.value_out = nn.Linear(ATTN, 1)
+        self.cfg_policy = nn.Linear(3 * ATTN, D)
+        self.head_policy = nn.Linear(2 * ATTN + D, D)
+
         self.act_kind = nn.Embedding(N_KINDS, C)
         self.act_role = nn.Embedding(5, C)
-        nn.init.normal_(self.act_kind.weight, std=C ** -0.5)
-        nn.init.ones_(self.act_role.weight)
         self.act_board = nn.Linear(D, C, bias=False)
         self.act_h = nn.Linear(D, C, bias=False)
         self.ln_act = nn.LayerNorm(C)
         self.act_out = nn.Linear(C, D)
-
-        self.join_p = nn.Linear(D, JW, bias=False)
-        self.join_b = nn.Linear(JOIN_IN, JW)
-        self.joinw = nn.ModuleList([nn.Linear(JW, JW) for _ in range(JBLOCKS)])
-        self.ln_join = nn.ModuleList([nn.LayerNorm(JW) for _ in range(JBLOCKS)])
-        self.ln_jout = nn.LayerNorm(JW)
-        self.join_out = nn.Linear(JW, D)
-        self.ln_h = nn.LayerNorm(D)
-        self.value_bias = nn.Parameter(torch.zeros(1))
-
-        nn.init.normal_(self.cfg_f.weight, std=1e-3)
-        nn.init.zeros_(self.cfg_f.bias)
+        nn.init.normal_(self.act_kind.weight, std=C ** -0.5)
+        nn.init.ones_(self.act_role.weight)
 
         nb = torch.as_tensor(warchest.hex_neighbours(), dtype=torch.long)
         self.register_buffer("nb", nb.view(N_HEXES, 6), persistent=False)
         self.register_buffer("seat_of", torch.arange(NTYPE) // NSLOT,
                              persistent=False)
-
 
     def cards(self, xpub):
         facts = xpub[:, OFF_CARDS:OFF_CARDS + NTYPE * CARD_FEATS]
@@ -121,24 +111,33 @@ class Net(nn.Module):
             x = x + self.blk2[i](gelu(self.ln2[i](y)))
         return gelu(self.ln_trunk(x))
 
-    def position(self, xpub, tokens):
-        projected = self.tok_stem(tokens)
-        x = self.trunk(xpub, projected)
+    def position(self, xpub, cards):
+        projected = self.tok_stem(self.tokens(xpub, cards))
+        spatial = self.trunk(xpub, projected)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
-        board = self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
-        return board, projected, x
-
-    def board(self, xpub, tokens):
-        return self.position(xpub, tokens)[0]
+        board = self.board_out(torch.cat([
+            spatial.mean(1), spatial.amax(1), loose], -1))
+        return board, projected, spatial
 
     def configs(self, phi, own, seg):
         counts = phi.reshape(-1, 3, NSLOT).transpose(1, 2)
-        u = gelu(self.cfg1(torch.cat([counts, own[seg]], -1))).sum(1)
-        u = gelu(self.ln_cfg(u))
-        bag = self.cfg_m(own).reshape(-1, NSLOT, 3, POOL)[seg]
-        return (self.cfg_f(u),
-                self.cfg_g(u) + (counts.unsqueeze(-1) * bag).sum((1, 2)),
-                self.cfg_p(u))
+        query = self.cfg_in(torch.cat([counts, own[seg]], -1)).sum(1)
+        return gelu(self.ln_cfg(query + self.cfg_seat(seg % 2)))
+
+    def attend(self, query, tokens, board_of):
+        q = self.attn_q(query).reshape(-1, HEADS, HEAD)
+        k = self.attn_k(tokens).reshape(*tokens.shape[:2], HEADS, HEAD)
+        v = self.attn_v(tokens).reshape(*tokens.shape[:2], HEADS, HEAD)
+        score = torch.einsum("qhd,qthd->qht", q, k[board_of]) * HEAD ** -0.5
+        mixed = torch.einsum("qht,qthd->qhd", score.softmax(-1), v[board_of])
+        mixed = self.attn_out(mixed.flatten(1))
+        return self.ln_attn(query + mixed)
+
+    def belief_context(self, conditioned, weight, seg, nseg):
+        pooled = conditioned.new_zeros(nseg, ATTN)
+        pooled.index_add_(0, seg, conditioned * weight.unsqueeze(1))
+        other = torch.arange(nseg, device=seg.device) ^ 1
+        return torch.cat([pooled, pooled[other]], -1)
 
     def actions(self, desc, boards, heads, cards, spatial, board_of, head_of):
         row = board_of
@@ -159,33 +158,23 @@ class Net(nn.Module):
              + self.act_board(boards)[row] + self.act_h(heads)[head_of])
         return self.act_out(gelu(self.ln_act(z)))
 
-    def join(self, p, pooled, seat):
-        z = self.join_p(p) + self.join_b(torch.cat([pooled, seat], -1))
-        for i in range(JBLOCKS):
-            z = z + self.joinw[i](gelu(self.ln_join[i](z)))
-        return self.ln_h(p + self.join_out(gelu(self.ln_jout(z))))
-
-    def heads(self, p, g, weight, seg, nseg):
-        pooled = p.new_zeros(nseg, POOL)
-        pooled.index_add_(0, seg, g * weight.unsqueeze(1))
-        other = torch.arange(nseg, device=seg.device) ^ 1
-        pair = torch.cat([pooled, pooled[other]], -1)
-        seat = p.new_tensor([-1.0, 1.0]).repeat(p.shape[0]).unsqueeze(1)
-        return self.join(p.repeat_interleave(2, 0), pair, seat)
-
-
     def evaluate(self, xpub, phi, weight, seg, nseg):
         cards = self.cards(xpub)
-        board, projected, spatial = self.position(xpub, self.tokens(xpub, cards))
+        board, projected, spatial = self.position(xpub, cards)
         own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
-        f, g, fp = self.configs(phi, own, seg)
-        h = self.heads(board, g, weight, seg, nseg)
-        value = (f * h[seg]).sum(1) + self.value_bias
-        return value, (cards, board, projected, spatial, fp, h)
+        query = self.configs(phi, own, seg)
+        public = self.token_in(torch.cat([spatial, projected], 1))
+        conditioned = self.attend(query, public, seg // 2)
+        belief = self.belief_context(conditioned, weight, seg, nseg)
+        context = torch.cat([conditioned, board[seg // 2], belief[seg]], -1)
+        value = self.value_out(gelu(self.value_hidden(context))).squeeze(1)
+        fp = self.cfg_policy(torch.cat([conditioned, belief[seg]], -1))
+        head = self.head_policy(torch.cat([
+            board.repeat_interleave(2, 0), belief], -1))
+        return value, (cards, board, projected, spatial, fp, head)
 
     def forward(self, xpub, phi, weight, seg, nseg):
         return self.evaluate(xpub, phi, weight, seg, nseg)[0]
-
 
     def flat(self):
         blocks = [m for i in range(BLOCKS)
@@ -195,14 +184,15 @@ class Net(nn.Module):
             self.hex_stem, self.tok_stem, self.pos, self.glob_stem,
             *blocks,
             self.board_out,
-            self.cfg1, self.cfg_f, self.cfg_g, self.cfg_m,
-            self.cfg_p, self.act_kind, self.act_role, self.act_board, self.act_out,
-            self.join_p, self.join_b, *self.joinw, self.join_out,
+            self.cfg_in, self.cfg_seat, self.token_in,
+            self.attn_q, self.attn_k, self.attn_v, self.attn_out,
+            self.value_hidden, self.value_out,
+            self.cfg_policy, self.head_policy,
+            self.act_kind, self.act_role, self.act_board, self.act_out,
             self.act_h,
         ]
         norms = [n for i in range(BLOCKS) for n in (self.ln1[i], self.ln2[i])]
-        norms += [self.ln_trunk, self.ln_cfg, *self.ln_join,
-                  self.ln_jout, self.ln_h, self.ln_act]
+        norms += [self.ln_trunk, self.ln_cfg, self.ln_attn, self.ln_act]
 
         def raw(t):
             return t.detach().cpu().contiguous().numpy().ravel()
@@ -211,10 +201,9 @@ class Net(nn.Module):
              for m in mats]
         b = [raw(m.bias) for m in mats
              if not isinstance(m, nn.Embedding) and m.bias is not None]
-        b.append(raw(self.value_bias))
         ln = [x for n in norms for x in (raw(n.weight), raw(n.bias))]
-        f = lambda xs: np.ascontiguousarray(np.concatenate(xs), np.float32)
-        return f(w), f(b), f(ln)
+        flatten = lambda xs: np.ascontiguousarray(np.concatenate(xs), np.float32)
+        return flatten(w), flatten(b), flatten(ln)
 
     def push(self):
         warchest.set_weights(*self.flat())

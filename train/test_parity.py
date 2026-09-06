@@ -109,6 +109,32 @@ def slot_invariance(net, rng, perms=6):
     print(f"slot invariance ok: worst {worst:.3e}, {worst / spread:.1e} of the "
           f"value spread ({spread:.3e})")
 
+
+def attention_token_relabelling(net, rng):
+    query = torch.from_numpy(rng.standard_normal((9, 128)).astype(np.float32))
+    tokens = torch.from_numpy(rng.standard_normal((3, 49, 128)).astype(np.float32))
+    board_of = torch.as_tensor([0, 2, 1, 1, 0, 2, 0, 1, 2])
+    permutation = torch.as_tensor(rng.permutation(tokens.shape[1]))
+    with torch.no_grad():
+        base = net.attend(query, tokens, board_of)
+        relabelled = net.attend(query, tokens[:, permutation], board_of)
+    torch.testing.assert_close(relabelled, base, rtol=1e-5, atol=1e-6)
+    print("attention token relabelling ok")
+
+
+def cross_board_isolation(net, rng):
+    sizes = [3, 4, 2, 5]
+    xpub = public_rows(rng, 2)
+    seg, phi, weight = belief(rng, sizes)
+    base = run(net, xpub, phi, weight, seg, len(sizes))
+    changed = xpub.copy()
+    changed[1] = public_rows(rng, 1)[0]
+    got = run(net, changed, phi, weight, seg, len(sizes))
+    np.testing.assert_allclose(got[seg < 2], base[seg < 2], rtol=0, atol=0)
+    assert np.max(np.abs(got[seg >= 2] - base[seg >= 2])) > 1e-5
+    print("cross-board isolation ok")
+
+
 def offboard_pile_visibility(net, rng):
     sizes = [1, 1]
     xpub = public_rows(rng, len(sizes) // 2)
@@ -156,7 +182,8 @@ def packed_row_cuda_parity():
 def main():
     rng = np.random.default_rng(11)
     net = random_net(7)
-    net.push()
+    attention_token_relabelling(net, rng)
+    cross_board_isolation(net, rng)
     slot_invariance(net, rng)
     offboard_pile_visibility(net, rng)
     packed_row_cuda_parity()

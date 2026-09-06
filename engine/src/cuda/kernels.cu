@@ -409,6 +409,80 @@ void k_trunk(float* x0, const int* nb, const float* __restrict__ w,
         out[(size_t)row * width + 2 * c + k] = xpub[(size_t)row * stride + off_loose + k];
 }
 
+__global__ void k_public_cache(const Tree* trees, const unsigned int* part,
+                               const unsigned int* board, float* out, int rows,
+                               int tokens, int c) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * tokens * c) return;
+    int r = i / (tokens * c), t = (i / c) % tokens, j = i % c;
+    const Tree& tree = trees[part[r]];
+    out[i] = t < N_HEXES
+        ? tree.spatial[((size_t)board[r] * N_HEXES + t) * c + j]
+        : tree.tokens[((size_t)board[r] * NTYPE + t - N_HEXES) * c + j];
+}
+
+__global__ void k_attention(const Tree* trees, const float* key,
+                            const float* value, const unsigned int* part,
+                            const unsigned int* board,
+                            const unsigned int* config, float* out, int n,
+                            int tokens, int attn, int heads) {
+    extern __shared__ float score[];
+    int pair = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
+    if (pair >= n || head >= heads) return;
+    int width = attn / heads;
+    const Tree& tree = trees[part[pair]];
+    const float* q = tree.attn_query + (size_t)config[pair] * attn + head * width;
+    const float* k = key + ((size_t)board[pair] * tokens * heads + head) * width;
+    float top = neg_inf();
+    for (int t = 0; t < tokens; ++t) {
+        float v = lane < width ? q[lane] * k[(size_t)t * attn + lane] : 0.0f;
+        v = warp_sum(v) * rsqrtf((float)width);
+        if (lane == 0) score[t] = v;
+        top = fmaxf(top, v);
+    }
+    __syncwarp();
+    top = __shfl_sync(0xffffffff, top, 0);
+    float total = 0.0f;
+    if (lane == 0)
+        for (int t = 0; t < tokens; ++t) total += expf(score[t] - top);
+    total = __shfl_sync(0xffffffff, total, 0);
+    const float* values = value + ((size_t)board[pair] * tokens * heads + head) * width;
+    float mixed = 0.0f;
+    if (lane < width)
+        for (int t = 0; t < tokens; ++t)
+            mixed += expf(score[t] - top) / total * values[(size_t)t * attn + lane];
+    if (lane < width) out[(size_t)pair * attn + head * width + lane] = mixed;
+}
+
+__global__ void k_attention_residual(const Tree* trees, float* out,
+                                     const unsigned int* part,
+                                     const unsigned int* config,
+                                     const float* gamma, const float* beta,
+                                     int n, int width) {
+    int r = blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= n) return;
+    const float* query = trees[part[r]].query + (size_t)config[r] * width;
+    float values[4];
+    float sum = 0.0f;
+    int count = 0;
+    for (int j = threadIdx.x; j < width; j += 32) {
+        float v = out[(size_t)r * width + j] + query[j];
+        values[count++] = v;
+        sum += v;
+    }
+    sum = warp_sum(sum);
+    float mean = sum / width, var = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        float d = values[i] - mean;
+        var += d * d;
+    }
+    float inv = rsqrtf(warp_sum(var) / width + 1e-5f);
+    count = 0;
+    for (int j = threadIdx.x; j < width; j += 32)
+        out[(size_t)r * width + j] =
+            (values[count++] - mean) * inv * gamma[j] + beta[j];
+}
+
 __global__ void k_cfg_slots(const float* phi, const unsigned int* owner,
                             const float* cards, float* slots, int n, int nslot,
                             int cfeat, int ntype, int type) {
@@ -423,6 +497,13 @@ __global__ void k_cfg_slots(const float* phi, const unsigned int* owner,
     else slots[i] = cards[((size_t)owner[cfg] * nslot + k) * type + j - 3];
 }
 
+__global__ void k_cfg_seat(float* query, const unsigned int* owner,
+                           const float* seat, int n, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * width) return;
+    query[i] += seat[(size_t)(owner[i / width] & 1u) * width + i % width];
+}
+
 __global__ void k_sum_slots(const float* hidden, float* out, int n, int nslot,
                             int width) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -434,21 +515,7 @@ __global__ void k_sum_slots(const float* hidden, float* out, int n, int nslot,
     out[i] = acc;
 }
 
-__global__ void k_bag(const float* bag, const float* phi,
-                      const unsigned int* owner, float* g, int n, int nslot,
-                      int ntype, int cfeat, int pool) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n * pool) return;
-    int cfg = i / pool, j = i % pool;
-    const float* v = bag + (size_t)owner[cfg] * nslot * 3 * pool;
-    float acc = 0.0f;
-    for (int k = 0; k < nslot; ++k)
-        for (int zone = 0; zone < 3; ++zone) {
-            float count = phi[(size_t)cfg * cfeat + zone * nslot + k];
-            if (count != 0.0f) acc += count * v[((size_t)k * 3 + zone) * pool + j];
-        }
-    g[i] += acc;
-}
+
 
 
 __global__ void k_scatter(const unsigned int* blob, unsigned int* const* dst,
@@ -623,232 +690,63 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
     }
 }
 
-#define J_SPAN (J_W / 8)
-#define J_MT (J_ROWS / 16)
-#define J_LDS (J_IN + 4)
-#define J_KS_IN (J_IN / 8)
-#define J_KS (J_W / 8)
-#define J_Q (J_W / 32)
-#define J_OUT_TILES (J_D / 8)
-#define J_PACK_B ((size_t)J_KS_IN * J_SPAN * 64)
-#define J_PACK_W ((size_t)J_KS * J_SPAN * 64)
-
-__device__ __forceinline__ void join_mma(float (&d)[J_MT][4], const float* act,
-                                         const float* w, int ks, int ntiles,
-                                         int nt0) {
-    int lane = threadIdx.x, slot = threadIdx.y;
-    for (int k = 0; k < ks; ++k) {
-        unsigned b[2];
-        frag_b(w, k, nt0 + slot, lane, ntiles, b);
-#pragma unroll
-        for (int m = 0; m < J_MT; ++m) {
-            unsigned a[4];
-            frag_a(act, m, 8 * k, lane, J_LDS, a);
-            mma_tile(d[m], a, b);
+__global__ void k_belief(const Tree* trees, const int* part_of_row,
+                         const int* local_row, float* out, int rows, int q0,
+                         int attn) {
+    int k = blockIdx.x, role = blockIdx.y, lane = threadIdx.x;
+    if (k >= rows || role >= 2) return;
+    int r = q0 + (k >> 1);
+    unsigned int player = (k & 1) ^ role;
+    const Tree& t = trees[part_of_row[r]];
+    unsigned int row = local_row[r], node = t.leaf_node[row];
+    unsigned int count = t.nc[2 * node + player];
+    unsigned int ra = rbase(t, node, player);
+    float total = 0.0f;
+    for (unsigned int c = lane; c < count; c += 32) total += t.reach[ra + c];
+    total = warp_sum(total);
+    float inv = total > SMOOTH ? 1.0f / total : 1.0f / (float)max(count, 1u);
+    unsigned int cs = t.coff[2 * row + player];
+    for (int j = lane; j < attn; j += 32) {
+        float acc = 0.0f;
+        for (unsigned int c = 0; c < count; ++c) {
+            float weight = total > SMOOTH ? t.reach[ra + c] * inv : inv;
+            unsigned int pair = t.aidx[cs + c];
+            acc += weight * t.conditioned[(size_t)pair * attn + j];
         }
+        out[((size_t)k * 2 + role) * attn + j] = acc;
     }
 }
 
-__device__ __forceinline__ void join_norm(float (&z)[J_MT][4], float* act,
-                                          const float* gamma, const float* beta,
-                                          const float* add) {
-    __syncthreads();
-    int lane = threadIdx.x, slot = threadIdx.y;
-#pragma unroll
-    for (int m = 0; m < J_MT; ++m)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
-            act[r * J_LDS + j] = z[m][i] + add[j];
+__global__ void k_value(const Tree* trees, const int* part_of_row,
+                        const int* local_row, const float* belief_projection,
+                        const float* hidden_b, const float* out_w,
+                        const float* out_b, int rows, int q0, int attn) {
+    __shared__ float hidden[128];
+    int k = blockIdx.x, lane = threadIdx.x;
+    if (k >= rows) return;
+    int r = q0 + (k >> 1);
+    unsigned int player = k & 1;
+    const Tree& t = trees[part_of_row[r]];
+    unsigned int row = local_row[r], node = t.leaf_node[row];
+    unsigned int count = t.nc[2 * node + player];
+    unsigned int cs = t.coff[2 * row + player];
+    unsigned int board = t.board_of[row];
+    const float* bp = t.value_board + (size_t)board * attn;
+    const float* rp = belief_projection + (size_t)k * attn;
+    float* opinion = t.opinion + player * t.nvals + t.voff[node];
+    for (unsigned int c = 0; c < count; ++c) {
+        unsigned int pair = t.aidx[cs + c];
+        const float* pp = t.value_cfg + (size_t)pair * attn;
+        if (lane < attn)
+            hidden[lane] = gelu1(pp[lane] + bp[lane] + rp[lane] + hidden_b[lane])
+                         * out_w[lane];
+        __syncthreads();
+        for (int offset = attn >> 1; offset > 0; offset >>= 1) {
+            if (lane < offset) hidden[lane] += hidden[lane + offset];
+            __syncthreads();
         }
-    __syncthreads();
-#pragma unroll
-    for (int t = 0; t < J_MT; ++t) {
-        int r = slot + t * J_SPAN;
-        float cur[J_Q];
-#pragma unroll
-        for (int q = 0; q < J_Q; ++q) cur[q] = act[r * J_LDS + lane + 32 * q];
-        float s = 0.0f;
-#pragma unroll
-        for (int q = 0; q < J_Q; ++q) s += cur[q];
-        s = warp_sum(s);
-        float mean = s / (float)J_W, var = 0.0f;
-#pragma unroll
-        for (int q = 0; q < J_Q; ++q) {
-            float d = cur[q] - mean;
-            var += d * d;
-        }
-        var = warp_sum(var);
-        float inv = rsqrtf(var / (float)J_W + 1e-5f);
-#pragma unroll
-        for (int q = 0; q < J_Q; ++q) {
-            int j = lane + 32 * q;
-            act[r * J_LDS + j] =
-                tf32(gelu1((cur[q] - mean) * inv * gamma[j] + beta[j]));
-        }
-    }
-    __syncthreads();
-}
-
-__global__ __launch_bounds__(32 * J_SPAN, 2)
-void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
-            const int* base_of_part, const unsigned int* coff,
-            const float* wj, const float* lnj, const float* owed,
-            const float* cf_bias, const float* gamma, const float* beta,
-            int rows, int q0) {
-    __shared__ __align__(16) float shared[J_ROWS * J_D];
-    float* act = shared;
-    float* pooled = shared + J_ROWS * J_LDS;
-
-    int lane = threadIdx.x, slot = threadIdx.y;
-    int tid = lane + 32 * slot, nt = 32 * J_SPAN;
-    int row0 = blockIdx.x * J_ROWS;
-    float z[J_MT][4];
-
-    for (int qr = slot; qr < J_ROWS; qr += J_SPAN) {
-        int query = row0 + qr;
-        if (query >= rows) continue;
-        int r = q0 + (query >> 1), p = query & 1;
-        int part = part_of_row[r];
-        const Tree& t = trees[part];
-        unsigned int node = t.leaf_node[local_row[r]];
-        unsigned int n = t.nc[2 * node + p], ra = rbase(t, node, p);
-        unsigned int base = base_of_part[part];
-        unsigned int lo = coff[2 * r + p], hi = coff[2 * r + p + 1];
-        float total = 0.0f;
-        for (unsigned int c = lane; c < n; c += 32) total += t.reach[ra + c];
-        total = warp_sum(total);
-        float inv = total > SMOOTH ? 1.0f / total : 1.0f / (float)max(n, 1u);
-        for (int j = lane; j < J_POOL; j += 32) {
-            float acc = 0.0f;
-            for (unsigned int k = lo; k < hi; ++k) {
-                float belief = total > SMOOTH ? t.reach[ra + k - lo] * inv : inv;
-                acc += belief * t.g[(size_t)t.cidx[k - base] * J_POOL + j];
-            }
-            pooled[(size_t)qr * J_POOL + j] = acc;
-        }
-    }
-    __syncthreads();
-
-    for (int e = tid; e < J_ROWS * J_LDS; e += nt) {
-        int i = e / J_LDS, c = e % J_LDS;
-        int row = row0 + i;
-        float v = 0.0f;
-        if (row < rows && c < J_W) {
-            int rr = q0 + (row >> 1);
-            const Tree& t = trees[part_of_row[rr]];
-            v = t.jp[(size_t)t.board_of[local_row[rr]] * J_W + c];
-        }
-        act[e] = v;
-    }
-    __syncthreads();
-#pragma unroll
-    for (int m = 0; m < J_MT; ++m)
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-            z[m][i] = act[frag_row(m, i, lane) * J_LDS + frag_col(i, slot, lane)];
-    __syncthreads();
-
-    for (int e = tid; e < J_ROWS * J_LDS; e += nt) {
-        int i = e / J_LDS, c = e % J_LDS;
-        int row = row0 + i;
-        float v = 0.0f;
-        if (row < rows && c < 2 * J_POOL + 1) {
-            int qr = row - row0, p = row & 1;
-            const float* mine = pooled + (size_t)qr * J_POOL;
-            const float* theirs = pooled + (size_t)(qr ^ 1) * J_POOL;
-            if (c < J_POOL) v = mine[c];
-            else if (c < 2 * J_POOL) v = theirs[c - J_POOL];
-            else v = p == 0 ? -1.0f : 1.0f;
-        }
-        act[e] = tf32(v);
-    }
-    __syncthreads();
-
-    join_mma(z, act, wj, J_KS_IN, J_SPAN, 0);
-    const float* w = wj + J_PACK_B;
-    for (int blk = 0; blk < J_BLOCKS; ++blk) {
-        join_norm(z, act, lnj + 2 * blk * J_W, lnj + (2 * blk + 1) * J_W,
-                  owed + blk * J_W);
-        join_mma(z, act, w, J_KS, J_SPAN, 0);
-        w += J_PACK_W;
-    }
-    join_norm(z, act, lnj + 2 * J_BLOCKS * J_W, lnj + (2 * J_BLOCKS + 1) * J_W,
-              owed + J_BLOCKS * J_W);
-
-    float head0[J_MT][4];
-    for (int pass = 0; pass < J_D / J_W; ++pass) {
-#pragma unroll
-        for (int m = 0; m < J_MT; ++m)
-#pragma unroll
-            for (int i = 0; i < 4; ++i) z[m][i] = 0.0f;
-        join_mma(z, act, w, J_KS, J_OUT_TILES, pass * J_SPAN);
-        if (pass == 0) {
-#pragma unroll
-            for (int m = 0; m < J_MT; ++m)
-#pragma unroll
-                for (int i = 0; i < 4; ++i) head0[m][i] = z[m][i];
-        }
-    }
-    __syncthreads();
-#pragma unroll
-    for (int m = 0; m < J_MT; ++m)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
-            int row = row0 + r;
-            if (row < rows) {
-                int rr = q0 + (row >> 1);
-                const Tree& t = trees[part_of_row[rr]];
-                const float* seed = t.p + (size_t)t.board_of[local_row[rr]] * J_D;
-                shared[(size_t)r * J_D + j] = head0[m][i] + seed[j] + owed[(J_BLOCKS + 1) * J_W + j];
-                shared[(size_t)r * J_D + J_W + j] = z[m][i] + seed[J_W + j]
-                    + owed[(J_BLOCKS + 1) * J_W + J_W + j];
-            }
-        }
-    __syncthreads();
-
-    for (int lr = slot; lr < J_ROWS; lr += J_SPAN) {
-        int row = row0 + lr;
-        if (row >= rows) continue;
-        float h[J_D / 32];
-        float sum = 0.0f;
-#pragma unroll
-        for (int q = 0; q < J_D / 32; ++q) {
-            h[q] = shared[(size_t)lr * J_D + lane + 32 * q];
-            sum += h[q];
-        }
-        sum = warp_sum(sum);
-        float mean = sum / (float)J_D, var = 0.0f;
-#pragma unroll
-        for (int q = 0; q < J_D / 32; ++q) {
-            float d = h[q] - mean;
-            var += d * d;
-        }
-        float inv = rsqrtf(warp_sum(var) / (float)J_D + 1e-5f);
-#pragma unroll
-        for (int q = 0; q < J_D / 32; ++q) {
-            int j = lane + 32 * q;
-            h[q] = (h[q] - mean) * inv * gamma[j] + beta[j];
-        }
-
-        int traverser = row & 1, r = q0 + (row >> 1);
-        const Tree& t = trees[part_of_row[r]];
-        unsigned int node = t.leaf_node[local_row[r]];
-        unsigned int lo = coff[2 * r + traverser], hi = coff[2 * r + traverser + 1];
-        unsigned int cs = t.coff[2 * local_row[r] + traverser];
-        float bias = *cf_bias;
-        float* opinion = t.opinion + traverser * t.nvals;
-        unsigned int vo = t.voff[node];
-        for (unsigned int k = lo; k < hi; ++k) {
-            const float* fr = t.f + (size_t)t.cidx[cs + k - lo] * J_D;
-            float acc = 0.0f;
-#pragma unroll
-            for (int q = 0; q < J_D / 32; ++q) acc += fr[lane + 32 * q] * h[q];
-            for (int s = 16; s > 0; s >>= 1)
-                acc += __shfl_down_sync(0xffffffff, acc, s);
-            if (lane == 0) opinion[vo + k - lo] = acc + bias;
-        }
+        if (lane == 0) opinion[c] = hidden[0] + *out_b;
+        __syncthreads();
     }
 }
 
@@ -994,37 +892,40 @@ __global__ void k_act_feats(const Tree* trees, const unsigned int* part,
     out[i] = v;
 }
 
-__global__ void k_prior_inputs(const Tree* trees, const unsigned int* part,
-                               const unsigned int* node_of,
-                               const unsigned int* row_of, float* input,
-                               float* p_out, float* jp_out, int m, int pool,
-                               int d, int jw) {
+__global__ void k_policy_inputs(const Tree* trees, const unsigned int* part,
+                                const unsigned int* node_of,
+                                const unsigned int* row_of, float* input,
+                                float* belief_out, float* board_out, int m,
+                                int attn, int d) {
     int k = blockIdx.x, lane = threadIdx.x;
     if (k >= m) return;
     const Tree& t = trees[part[k]];
     unsigned int node = node_of[k], me = t.player[node];
     for (int role = 0; role < 2; ++role) {
         unsigned int player = role == 0 ? me : 1 - me;
-        unsigned int n = t.nc[2 * node + player];
-        unsigned int ra = rbase(t, node, player);
+        unsigned int n = t.nc[2 * node + player], ra = rbase(t, node, player);
         float total = 0.0f;
         for (unsigned int c = lane; c < n; c += 32) total += t.reach[ra + c];
         total = warp_sum(total);
         float inv = total > SMOOTH ? 1.0f / total : 1.0f / (float)max(n, 1u);
         unsigned int cs = t.coff[2 * row_of[k] + player];
-        for (int j = lane; j < pool; j += 32) {
+        for (int j = lane; j < attn; j += 32) {
             float acc = 0.0f;
             for (unsigned int c = 0; c < n; ++c) {
                 float belief = total > SMOOTH ? t.reach[ra + c] * inv : inv;
-                acc += belief * t.g[(size_t)t.cidx[cs + c] * pool + j];
+                unsigned int pair = t.aidx[cs + c];
+                acc += belief * t.conditioned[(size_t)pair * attn + j];
             }
-            input[(size_t)k * (2 * pool + 1) + role * pool + j] = acc;
+            input[(size_t)k * (d + 2 * attn) + d + role * attn + j] = acc;
+            belief_out[((size_t)k * 2 + role) * attn + j] = acc;
         }
     }
-    if (lane == 0) input[(size_t)k * (2 * pool + 1) + 2 * pool] = me == 0 ? -1.0f : 1.0f;
     unsigned int board = t.board_of[row_of[k]];
-    for (int j = lane; j < d; j += 32) p_out[(size_t)k * d + j] = t.p[(size_t)board * d + j];
-    for (int j = lane; j < jw; j += 32) jp_out[(size_t)k * jw + j] = t.jp[(size_t)board * jw + j];
+    for (int j = lane; j < d; j += 32) {
+        float v = t.p[(size_t)board * d + j];
+        input[(size_t)k * (d + 2 * attn) + j] = v;
+        board_out[(size_t)k * d + j] = v;
+    }
 }
 
 __global__ void k_act_add(float* z, const float* proj, const unsigned int* of,
@@ -1038,6 +939,7 @@ __global__ void k_prior(const Tree* trees, const unsigned int* part,
                         const unsigned int* node_of, const unsigned int* row_of,
                         const unsigned int* act_at, const unsigned int* cell_at,
                         const unsigned int* cells, const float* e,
+                        const float* belief_projection, const float* cfg_b,
                         const float* inv_t, int m, int d) {
     int k = blockIdx.y;
     if (k >= m) return;
@@ -1051,11 +953,18 @@ __global__ void k_prior(const Tree* trees, const unsigned int* part,
     if (a == b) return;
     int lane = threadIdx.x;
     unsigned int cs = t.coff[2 * row_of[k] + me];
-    const float* fp = t.fp + (size_t)t.cidx[cs + t.cell_row[so + a]] * d;
+    unsigned int pair = t.aidx[cs + t.cell_row[so + a]];
+    const float* pp = t.policy_cfg + (size_t)pair * d;
+    const float* bp = belief_projection + (size_t)k * d;
+    float fp[8];
+    for (int q = 0; q < d / 32; ++q) {
+        int j = lane + 32 * q;
+        fp[q] = pp[j] + bp[j] + cfg_b[j];
+    }
     for (unsigned int cell = a; cell < b; ++cell) {
         const float* ea = e + (size_t)(act_at[k] + cells[cell_at[k] + cell]) * d;
         float acc = 0.0f;
-        for (int j = lane; j < d; j += 32) acc += fp[j] * ea[j];
+        for (int q = 0; q < d / 32; ++q) acc += fp[q] * ea[lane + 32 * q];
         acc = warp_sum(acc);
         if (lane == 0) t.prior[so + cell] = acc;
     }
