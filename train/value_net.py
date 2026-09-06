@@ -124,14 +124,9 @@ class Net(nn.Module):
         query = gelu(self.cfg_in(torch.cat([counts, own[seg]], -1))).sum(1)
         return gelu(self.ln_cfg(query + self.cfg_seat(seg % 2)))
 
-    def attend(self, query, tokens, board_of):
+    def attend(self, query, tokens, board_of, attention):
         boards, ntokens = tokens.shape[:2]
-        counts = torch.bincount(board_of, minlength=boards)
-        starts = counts.cumsum(0) - counts
-        order = board_of.argsort()
-        slot = torch.empty_like(board_of)
-        slot[order] = torch.arange(query.shape[0], device=query.device) - starts[board_of[order]]
-        width = int(counts.max())
+        slot, width = attention
         q = query.new_zeros(boards, width, ATTN)
         q[board_of, slot] = self.attn_q(query)
         q = q.reshape(boards, width, HEADS, HEAD).transpose(1, 2)
@@ -167,13 +162,13 @@ class Net(nn.Module):
              + self.act_board(boards)[row] + self.act_h(heads)[head_of])
         return self.act_out(gelu(self.ln_act(z)))
 
-    def evaluate(self, xpub, phi, weight, seg, nseg):
+    def evaluate(self, xpub, phi, weight, seg, nseg, attention):
         cards = self.cards(xpub)
         board, projected, spatial = self.position(xpub, cards)
         own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
         query = self.configs(phi, own, seg)
         public = self.token_in(torch.cat([spatial, projected], 1))
-        conditioned = self.attend(query, public, seg // 2)
+        conditioned = self.attend(query, public, seg // 2, attention)
         belief = self.belief_context(conditioned, weight, seg, nseg)
         context = torch.cat([conditioned, board[seg // 2], belief[seg]], -1)
         value = self.value_out(gelu(self.value_hidden(context))).squeeze(1)
@@ -182,8 +177,8 @@ class Net(nn.Module):
             board.repeat_interleave(2, 0), belief], -1))
         return value, (cards, board, projected, spatial, fp, head)
 
-    def forward(self, xpub, phi, weight, seg, nseg):
-        return self.evaluate(xpub, phi, weight, seg, nseg)[0]
+    def forward(self, xpub, phi, weight, seg, nseg, attention):
+        return self.evaluate(xpub, phi, weight, seg, nseg, attention)[0]
 
     def flat(self):
         blocks = [m for i in range(BLOCKS)

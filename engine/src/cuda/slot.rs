@@ -28,8 +28,8 @@ pub fn tree_source() -> String {
     for c in &TABLE {
         out += &format!("    {} {};\n", c.ty, c.name);
     }
-    for tail in ["const float* conditioned", "const float* value_cfg",
-                 "const float* policy_cfg", "unsigned long long* seed",
+    for tail in ["float* conditioned", "float* value_cfg",
+                 "unsigned long long* seed",
                  "unsigned long long nterm", "unsigned long long nvals",
                  "unsigned long long step", "unsigned long long todo",
                  "unsigned long long nexpand"] {
@@ -94,7 +94,7 @@ const TABLE: [Col; 53] = [
     Col { ent: Ent::Row, width: 1, dst: Some(Dst::Term), name: "term", ty: CU },
 ];
 
-pub const DESC: usize = TABLE.len() + 9;
+pub const DESC: usize = TABLE.len() + 8;
 
 const fn fields() -> [usize; 8] {
     let mut f = [0; 8];
@@ -212,23 +212,6 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         let dst = self.buf.as_mut().expect("a capacity implies a buffer");
         let mut d = dst.slice_mut(at..at + host.len());
         stream.memcpy_htod(host, &mut d).map_err(err)
-    }
-
-    pub fn put_dtod(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        at: usize,
-        src: &CudaSlice<T>,
-        from: usize,
-        n: usize,
-    ) -> Res<()> {
-        if at + n > self.cap {
-            return Err(format!("scratch grew past its slot: {} > {}", at + n, self.cap));
-        }
-        self.len = self.len.max(at + n);
-        if n == 0 { return Ok(()); }
-        let dst = self.buf.as_mut().expect("a capacity implies a buffer");
-        stream.memcpy_dtod(&src.slice(from..from + n), &mut dst.slice_mut(at..at + n)).map_err(err)
     }
 
     pub fn room(&mut self, want: usize) -> Res<&mut CudaSlice<T>> {
@@ -367,7 +350,6 @@ pub struct Solve {
     pub level_start: Vec<u32>,
     pub conditioned: Arr<f32>,
     pub value_cfg: Arr<f32>,
-    pub policy_cfg: Arr<f32>,
     pub seed: Arr<u64>,
     pub step: usize,
     pub todo: usize,
@@ -405,7 +387,6 @@ impl Solve {
             level_start: Vec::new(),
             conditioned: Arr::with_cap(s, b.cap(Ent::Cidx) * ATTN)?,
             value_cfg: Arr::with_cap(s, b.cap(Ent::Cidx) * ATTN)?,
-            policy_cfg: Arr::with_cap(s, b.cap(Ent::Cidx) * D)?,
             seed: Arr::with_cap(s, 1)?,
             step: 0,
             todo: 0,
@@ -433,7 +414,6 @@ impl Solve {
         self.ent[Ent::Cidx as usize].rewind();
         self.conditioned.len = 0;
         self.value_cfg.len = 0;
-        self.policy_cfg.len = 0;
         self.nterm = 0;
         self.nvals = 0;
         self.ncells = 0;
@@ -451,7 +431,7 @@ impl Solve {
 
     pub fn bytes(&self) -> usize {
         self.ent.iter().map(Entity::bytes).sum::<usize>()
-            + (self.conditioned.cap + self.value_cfg.cap + self.policy_cfg.cap) * 4
+            + (self.conditioned.cap + self.value_cfg.cap) * 4
             + self.seed.cap * 8
     }
 
@@ -489,24 +469,6 @@ impl Solve {
         e.copy_f32(s, G_ATTN_QUERY, at * ATTN, attn_query, from * ATTN, n * ATTN)
     }
 
-    pub fn copy_pairs(
-        &mut self,
-        s: &Arc<CudaStream>,
-        at: usize,
-        conditioned: &CudaSlice<f32>,
-        value_cfg: &CudaSlice<f32>,
-        policy_cfg: &CudaSlice<f32>,
-        from: usize,
-        n: usize,
-    ) -> Res<()> {
-        let copy = |dst: &mut Arr<f32>, width, src: &CudaSlice<f32>| -> Res<()> {
-            dst.put_dtod(s, at * width, src, from * width, n * width)
-        };
-        copy(&mut self.conditioned, ATTN, conditioned)?;
-        copy(&mut self.value_cfg, ATTN, value_cfg)?;
-        copy(&mut self.policy_cfg, D, policy_cfg)
-    }
-
     pub fn view(&mut self, s: &Arc<CudaStream>, e: Ent, field: usize, at: usize, n: usize, width: usize) -> Res<u64> {
         self.reserve(e, (at + n).div_ceil(width.max(1)))?;
         Ok(self.ent[e as usize].field(field, s))
@@ -533,13 +495,12 @@ impl Solve {
         }
         out[i] = self.conditioned.ptr(s);
         out[i + 1] = self.value_cfg.ptr(s);
-        out[i + 2] = self.policy_cfg.ptr(s);
-        out[i + 3] = self.seed.ptr(s);
-        out[i + 4] = self.nterm as u64;
-        out[i + 5] = self.nvals as u64;
-        out[i + 6] = self.step as u64;
-        out[i + 7] = self.todo as u64;
-        out[i + 8] = self.nexpand as u64;
+        out[i + 2] = self.seed.ptr(s);
+        out[i + 3] = self.nterm as u64;
+        out[i + 4] = self.nvals as u64;
+        out[i + 5] = self.step as u64;
+        out[i + 6] = self.todo as u64;
+        out[i + 7] = self.nexpand as u64;
         out
     }
 }

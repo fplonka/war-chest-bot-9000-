@@ -73,12 +73,14 @@ kernels! {
     public_cache,
     attention,
     attention_residual,
+    attention_store,
     cfg_slots,
     cfg_seat,
     sum_slots,
     belief,
     value,
     policy_inputs,
+    policy_offset,
     leaf_scale,
     reach_sweep,
     backprop_sweep,
@@ -562,7 +564,7 @@ impl Device {
         if net.is_empty() {
             return Err("cannot publish empty weights to the device".into());
         }
-        let flat = net.flat();
+        let flat = net.inference_flat();
         for card in &mut self.cards {
             let _busy = card.busy.lock();
             card.stream.context().bind_to_thread().map_err(err)?;
@@ -618,9 +620,6 @@ impl Device {
             value_cfg: c.stream.memcpy_dtov(
                 &s.value_cfg.buf.as_ref().expect("value cache").slice(0..s.value_cfg.len)
             ).map_err(err)?,
-            policy_cfg: c.stream.memcpy_dtov(
-                &s.policy_cfg.buf.as_ref().expect("policy cache").slice(0..s.policy_cfg.len)
-            ).map_err(err)?,
             prior: s.ent[Ent::Cell as usize].get_f32(
                 &c.stream,
                 C_PRIOR,
@@ -642,7 +641,6 @@ pub struct Resident {
     pub query: Vec<f32>,
     pub conditioned: Vec<f32>,
     pub value_cfg: Vec<f32>,
-    pub policy_cfg: Vec<f32>,
     pub prior: Vec<f32>,
     pub cur: Vec<f32>,
     pub sum: Vec<f32>,
@@ -838,7 +836,7 @@ impl Card {
     fn on(gpu: &Gpu, net: &Net) -> Res<Card> {
         let stream = gpu.ctx.new_stream().map_err(err)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
-        let flat = net.flat();
+        let flat = net.inference_flat();
         let nb: Vec<i32> = board()
             .neighbors
             .iter()
@@ -1304,16 +1302,27 @@ impl Card {
         }
         let mut pairs = Vec::new();
         for (part, &i) in mine.iter().enumerate() {
-            let Call::Configs { pair_at, pair_board, pair_config, .. } = &calls[i] else { unreachable!() };
+            let Call::Configs { solve, pair_at, pair_board, pair_config, .. } = &calls[i] else { unreachable!() };
             assert_eq!(pair_board.len(), pair_config.len());
+            let mut resident = self.solves.lock();
+            let slot = self.slot(&mut resident, *solve);
+            slot.conditioned.room((pair_at + pair_board.len()) * ATTN)?;
+            slot.value_cfg.room((pair_at + pair_board.len()) * ATTN)?;
             pairs.extend((0..pair_board.len()).map(|j| {
                 (part as u32, pair_at + j, pair_board[j], pair_config[j])
             }));
         }
+        pairs.sort_unstable_by_key(|p| (p.0, p.2));
+        let mut boards = Vec::new();
+        let mut offsets = vec![0];
+        for group in pairs.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
+            boards.push((group[0].0, group[0].2));
+            offsets.push(offsets.last().unwrap() + group.len());
+        }
         self.lay(&solves)?;
-        for at in (0..pairs.len()).step_by(ATTN_TILE) {
-            let end = (at + ATTN_TILE).min(pairs.len());
-            self.attention_tile(&solves, &pairs[at..end])?;
+        for at in (0..boards.len()).step_by(ATTN_TILE) {
+            let end = (at + ATTN_TILE).min(boards.len());
+            self.attention_boards(&boards[at..end], &pairs[offsets[at]..offsets[end]])?;
         }
         Ok(())
     }
@@ -1358,75 +1367,81 @@ impl Card {
         Ok(())
     }
 
-    fn attention_tile(&self, solves: &[usize], pairs: &[(u32, usize, u32, u32)]) -> Res<()> {
-        let mut boards = Vec::new();
-        let mut board_map = HashMap::new();
-        let mut pair_board = Vec::with_capacity(pairs.len());
-        for &(part, _, board, _) in pairs {
-            let next = board_map.len() as u32;
-            let index = *board_map.entry((part, board)).or_insert_with(|| {
-                boards.push((part, board));
-                next
-            });
-            pair_board.push(index);
+    fn attention_boards(&self, boards: &[(u32, u32)], pairs: &[(u32, usize, u32, u32)]) -> Res<()> {
+        {
+            let stream = &self.stream;
+            let mut stage = self.host.lock();
+            stage.board_part.put(stream, boards.len(), |dst| {
+                for (out, board) in dst.iter_mut().zip(boards) { *out = board.0; }
+                boards.len()
+            })?;
+            stage.board_local.put(stream, boards.len(), |dst| {
+                for (out, board) in dst.iter_mut().zip(boards) { *out = board.1; }
+                boards.len()
+            })?;
+            let batch = self.batch.lock();
+            let mut scratch = self.scratch.lock();
+            let ntokens = N_HEXES + NTYPE;
+            scratch.public.room(boards.len() * ntokens * C)?;
+            scratch.kv.room(boards.len() * ntokens * 2 * ATTN)?;
+            let Scratch { public, kv, .. } = &mut *scratch;
+            carved!(public, kv);
+            let (nb, tokens, c) = (boards.len() as i32, ntokens as i32, C as i32);
+            unsafe {
+                stream.launch_builder(&self.k.public_cache)
+                    .arg(batch.trees.buf()).arg(stage.board_part.buf()).arg(stage.board_local.buf())
+                    .arg(&mut *public).arg(&nb).arg(&tokens).arg(&c)
+                    .launch_unit(spread(boards.len() * ntokens * C))
+            }.map_err(err)?;
+            self.run(self.layout.attention_kv(), public, boards.len() * ntokens, kv)?;
         }
+        for tile in pairs.chunks(ATTN_TILE) {
+            self.attention_pairs(boards, tile)?;
+        }
+        Ok(())
+    }
+
+    fn attention_pairs(&self, boards: &[(u32, u32)], pairs: &[(u32, usize, u32, u32)]) -> Res<()> {
         let stream = &self.stream;
         let mut stage = self.host.lock();
         stage.pair_part.put(stream, pairs.len(), |dst| {
             for (out, pair) in dst.iter_mut().zip(pairs) { *out = pair.0; }
             pairs.len()
         })?;
-        stage.pair_board.put(stream, pairs.len(), copy(&pair_board))?;
+        stage.pair_at.put(stream, pairs.len(), |dst| {
+            for (out, pair) in dst.iter_mut().zip(pairs) { *out = pair.1 as u32; }
+            pairs.len()
+        })?;
+        stage.pair_board.put(stream, pairs.len(), |dst| {
+            for (out, pair) in dst.iter_mut().zip(pairs) {
+                *out = boards.binary_search(&(pair.0, pair.2)).expect("grouped board") as u32;
+            }
+            pairs.len()
+        })?;
         stage.pair_config.put(stream, pairs.len(), |dst| {
             for (out, pair) in dst.iter_mut().zip(pairs) { *out = pair.3; }
             pairs.len()
         })?;
-        stage.board_part.put(stream, boards.len(), |dst| {
-            for (out, board) in dst.iter_mut().zip(&boards) { *out = board.0; }
-            boards.len()
-        })?;
-        stage.board_local.put(stream, boards.len(), |dst| {
-            for (out, board) in dst.iter_mut().zip(&boards) { *out = board.1; }
-            boards.len()
-        })?;
         let batch = self.batch.lock();
         let mut scratch = self.scratch.lock();
-        let public_n = N_HEXES + NTYPE;
-        scratch.public.room(boards.len() * public_n * C)?;
-        scratch.encoded.room(boards.len() * public_n * ATTN)?;
-        scratch.queries.room(boards.len() * public_n * ATTN)?;
-        scratch.values.room(boards.len() * public_n * ATTN)?;
         scratch.facts.room(pairs.len() * ATTN)?;
         scratch.h.room(pairs.len() * ATTN)?;
         scratch.z.room(pairs.len() * ATTN)?;
-        scratch.input.room(pairs.len() * D)?;
-        let Scratch { public, encoded, queries, values, facts, h, z, input, .. } = &mut *scratch;
-        carved!(public, encoded, queries, values, facts, h, z, input);
-        let part = stage.pair_part.dev.buf.as_ref().expect("staged");
-        let board = stage.pair_board.dev.buf.as_ref().expect("staged");
-        let config = stage.pair_config.dev.buf.as_ref().expect("staged");
-        let board_part = stage.board_part.dev.buf.as_ref().expect("staged");
-        let board_local = stage.board_local.dev.buf.as_ref().expect("staged");
-        let (nb, tokens, c) = (boards.len() as i32, public_n as i32, C as i32);
+        let Scratch { kv, facts, h, z, .. } = &mut *scratch;
+        carved!(kv, facts, h, z);
+        let part = stage.pair_part.buf();
+        let config = stage.pair_config.buf();
+        let (n, attn, heads, tokens) = (
+            pairs.len() as i32, ATTN as i32, HEADS as i32, (N_HEXES + NTYPE) as i32);
         unsafe {
-            self.stream.launch_builder(&self.k.public_cache)
-                .arg(batch.trees.buf()).arg(board_part).arg(board_local).arg(&mut *public)
-                .arg(&nb).arg(&tokens).arg(&c)
-                .launch_unit(spread(boards.len() * public_n * C))
-        }.map_err(err)?;
-        self.run(self.layout.token_in, public, boards.len() * public_n, encoded)?;
-        self.run(self.layout.attn_k, encoded, boards.len() * public_n, queries)?;
-        self.run(self.layout.attn_v, encoded, boards.len() * public_n, values)?;
-        let (n, attn, heads) = (pairs.len() as i32, ATTN as i32, HEADS as i32);
-        unsafe {
-            self.stream.launch_builder(&self.k.attention)
-                .arg(batch.trees.buf()).arg(&*queries).arg(&*values)
-                .arg(part).arg(board).arg(config).arg(&mut *facts)
+            stream.launch_builder(&self.k.attention)
+                .arg(batch.trees.buf()).arg(&*kv)
+                .arg(part).arg(stage.pair_board.buf()).arg(config).arg(&mut *facts)
                 .arg(&n).arg(&tokens).arg(&attn).arg(&heads)
                 .launch_unit(LaunchConfig {
                     grid_dim: (pairs.len() as u32, HEADS as u32, 1),
                     block_dim: (32, 1, 1),
-                    shared_mem_bytes: (public_n * 4) as u32,
+                    shared_mem_bytes: (tokens * 4) as u32,
                 })
         }.map_err(err)?;
         self.run(self.layout.attn_out, facts, pairs.len(), h)?;
@@ -1434,28 +1449,15 @@ impl Card {
         let gamma = self.ln.slice(norm.g..norm.g + ATTN);
         let beta = self.ln.slice(norm.b..norm.b + ATTN);
         unsafe {
-            self.stream.launch_builder(&self.k.attention_residual)
+            stream.launch_builder(&self.k.attention_residual)
                 .arg(batch.trees.buf()).arg(&mut *h).arg(part).arg(config)
                 .arg(&gamma).arg(&beta).arg(&n).arg(&attn)
                 .launch_unit(warp_rows(pairs.len()))
         }.map_err(err)?;
         let value_cfg = Span { w: self.layout.value_hidden.w, b: usize::MAX, i: ATTN, o: ATTN };
-        let policy_cfg = Span { w: self.layout.cfg_policy.w, b: usize::MAX, i: ATTN, o: D };
         self.lin(value_cfg, h, pairs.len(), 0.0, z)?;
-        self.lin(policy_cfg, h, pairs.len(), 0.0, input)?;
-        let mut from = 0;
-        let mut resident = self.solves.lock();
-        while from < pairs.len() {
-            let part = pairs[from].0 as usize;
-            let mut end = from + 1;
-            while end < pairs.len() && pairs[end].0 as usize == part
-                && pairs[end].1 == pairs[from].1 + end - from {
-                end += 1;
-            }
-            self.slot(&mut resident, solves[part]).copy_pairs(
-                stream, pairs[from].1, h, z, input, from, end - from)?;
-            from = end;
-        }
+        launch!(self, attention_store, pairs.len() * ATTN,
+                batch.trees.buf(), part, stage.pair_at.buf(), &*h, &*z, &n, &attn)?;
         Ok(())
     }
 
@@ -1559,7 +1561,7 @@ impl Card {
         sc.action.room(na * C)?;
         sc.h.room((m * D).max(na * D))?;
         sc.facts.room(m * D)?;
-        sc.input.room(m * (D + 2 * ATTN))?;
+        sc.input.room((m * (D + 2 * ATTN)).max(na * ATTN))?;
         sc.queries.room(m * 2 * ATTN)?;
         sc.z.room(m * C)?;
         sc.pooled.room(m * C)?;
@@ -1647,6 +1649,14 @@ impl Card {
         )?;
         self.norm(l.norms[LN_ACT], na, true, action)?;
         self.run(l.act_out, action, na, h)?;
+        unsafe {
+            self.stream.launch_builder(&self.k.policy_offset)
+                .arg(&*h).arg(&*facts)
+                .arg(&self.b.slice(l.cfg_policy.b..l.cfg_policy.b + D))
+                .arg(&act_node_d).arg(&mut *action).arg(&na_i).arg(&d_i)
+                .launch_unit(warp_rows(na))
+        }.map_err(err)?;
+        self.lin(l.policy_action(), h, na, 0.0, input)?;
         const WARPS: u32 = 4;
         let cfg = LaunchConfig {
             grid_dim: (widest.div_ceil(WARPS).max(1), m as u32, 1),
@@ -1663,12 +1673,11 @@ impl Card {
                 .arg(&act_at_d)
                 .arg(&cell_at_d)
                 .arg(&cells_d)
-                .arg(&*h)
-                .arg(&*facts)
-                .arg(&self.b.slice(l.cfg_policy.b..l.cfg_policy.b + D))
+                .arg(&*input)
+                .arg(&*action)
                 .arg(&inv_d)
                 .arg(&m_i)
-                .arg(&d_i)
+                .arg(&attn_i)
                 .launch_unit(cfg)
         }
         .map_err(err)
@@ -2092,7 +2101,7 @@ impl Card {
                     .arg(&rows_i).arg(&q0_i).arg(&(ATTN as i32))
                     .launch_unit(LaunchConfig {
                         grid_dim: (rows as u32, 1, 1),
-                        block_dim: (ATTN as u32, 1, 1),
+                        block_dim: (32, 4, 1),
                         shared_mem_bytes: 0,
                     })
             }.map_err(err)?;
@@ -2178,6 +2187,7 @@ struct Stage {
     phi: Wire<f32>,
     owner: Wire<u32>,
     pair_part: Wire<u32>,
+    pair_at: Wire<u32>,
     pair_board: Wire<u32>,
     pair_config: Wire<u32>,
     board_part: Wire<u32>,
@@ -2199,8 +2209,7 @@ struct Scratch {
     leaves: Arr<u32>,
     queries: Arr<f32>,
     public: Arr<f32>,
-    encoded: Arr<f32>,
-    values: Arr<f32>,
+    kv: Arr<f32>,
     piles: Arr<f32>,
     tokens: Arr<f32>,
     projected: Arr<f32>,
@@ -2261,8 +2270,7 @@ impl Plan {
             leaves: self.arr(n * cfg.s.max(1) as usize)?,
             queries: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * ATTN)?,
             public: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * C)?,
-            encoded: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * ATTN)?,
-            values: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * ATTN)?,
+            kv: self.arr(ATTN_TILE * (N_HEXES + NTYPE) * 2 * ATTN)?,
             piles: self.arr(TILE * NTYPE * PILE_COUNTS)?,
             tokens: self.arr(TILE * NTYPE * TYPE)?,
             projected: self.arr(TILE * NTYPE * C)?,
@@ -2282,6 +2290,7 @@ impl Plan {
             phi: self.wire(configs * CFEAT)?,
             owner: self.wire(configs)?,
             pair_part: self.wire(ATTN_TILE)?,
+            pair_at: self.wire(ATTN_TILE)?,
             pair_board: self.wire(ATTN_TILE)?,
             pair_config: self.wire(ATTN_TILE)?,
             board_part: self.wire(ATTN_TILE)?,

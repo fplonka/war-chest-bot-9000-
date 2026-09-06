@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
 use warchest::contract::{Call, Reply};
-use warchest::net::{Net, NetLayout, Span, ATTN, D};
+use warchest::net::{Net, NetLayout, Span, ATTN};
 use warchest::pbs::{expand_row, pack_row, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
 use warchest::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
@@ -302,18 +302,29 @@ fn configuration_projections_match_the_device() {
     let resident = device.resident(0, 27).expect("resident attention");
     assert!(!pairs.is_empty());
     let layout = NetLayout::new();
-    for pair in pairs {
+    for &pair in &pairs {
         let conditioned = &resident.conditioned[pair * ATTN..(pair + 1) * ATTN];
         let want_value = linear(&net, Span {
             w: layout.value_hidden.w, b: usize::MAX, i: ATTN, o: ATTN,
         }, conditioned);
         let got_value = &resident.value_cfg[pair * ATTN..(pair + 1) * ATTN];
         assert!(worst_scaled(&want_value, got_value, "value configuration") < 2.0 * TF32);
-        let want_policy = linear(&net, Span {
-            w: layout.cfg_policy.w, b: usize::MAX, i: ATTN, o: D,
-        }, conditioned);
-        let got_policy = &resident.policy_cfg[pair * D..(pair + 1) * D];
-        assert!(worst_scaled(&want_policy, got_policy, "policy configuration") < 2.0 * TF32);
+    }
+    let Some(Call::Configs { cards, pair_board, pair_config, .. }) = calls.iter()
+        .find(|c| matches!(c, Call::Configs { .. })) else { panic!("configuration call") };
+    let sources: Vec<usize> = (0..2051).map(|i| (pairs.len() - 1) - i % pairs.len()).collect();
+    device.run(&[Call::Configs {
+        solve: 27, at: resident.query.len() / ATTN, n: 0,
+        phi: Vec::new(), owner: Vec::new(), cards: cards.clone(), pair_at: pairs.len(),
+        pair_board: sources.iter().map(|&i| pair_board[i]).collect(),
+        pair_config: sources.iter().map(|&i| pair_config[i]).collect(),
+    }], 0).expect("attention spanning query tiles with cached configurations");
+    let extended = device.resident(0, 27).expect("extended attention");
+    for (i, &source) in sources.iter().enumerate() {
+        let at = (pairs.len() + i) * ATTN;
+        let want = &resident.conditioned[source * ATTN..(source + 1) * ATTN];
+        let got = &extended.conditioned[at..at + ATTN];
+        assert!(worst_scaled(want, got, "tiled attention") < 2.0 * TF32);
     }
 }
 

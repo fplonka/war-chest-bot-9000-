@@ -19,6 +19,7 @@ fn dense(w: &[f32], b: &[f32], i: usize, o: usize, input: &[f32], rows: usize, o
     }
 }
 
+
 pub const TYPE: usize = 64;
 pub const C: usize = 96;
 pub const BLOCKS: usize = 8;
@@ -133,6 +134,14 @@ impl Default for NetLayout {
 }
 
 impl NetLayout {
+    pub fn attention_kv(&self) -> Span {
+        Span { w: self.w_len, b: self.b_len, i: C, o: 2 * ATTN }
+    }
+
+    pub fn policy_action(&self) -> Span {
+        Span { w: self.w_len + C * 2 * ATTN, b: usize::MAX, i: D, o: ATTN }
+    }
+
     pub fn new() -> Self {
         let mut c = Cursor::default();
         Self {
@@ -192,7 +201,7 @@ struct Lin {
     o: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Flat {
     pub w: Vec<f32>,
     pub b: Vec<f32>,
@@ -292,6 +301,30 @@ impl Net {
         &self.flat
     }
 
+    pub fn inference_flat(&self) -> Flat {
+        let l = NetLayout::new();
+        let mut flat = self.flat().clone();
+        let mut kv = Vec::with_capacity(ATTN * 2 * ATTN);
+        for i in 0..ATTN {
+            for span in [l.attn_k, l.attn_v] {
+                kv.extend_from_slice(&flat.w[span.w + i * ATTN..span.w + (i + 1) * ATTN]);
+            }
+        }
+        let mut projected = Vec::new();
+        dense(&kv, &[], ATTN, 2 * ATTN,
+              &flat.w[l.token_in.w..l.token_in.w + C * ATTN], C, &mut projected);
+        flat.w.extend_from_slice(&projected);
+        dense(&kv, &[], ATTN, 2 * ATTN,
+              &flat.b[l.token_in.b..l.token_in.b + ATTN], 1, &mut projected);
+        flat.b.extend(projected);
+        for i in 0..D {
+            for j in 0..ATTN {
+                flat.w.push(self.flat.w[l.cfg_policy.w + j * D + i]);
+            }
+        }
+        flat
+    }
+
     pub fn cards(&self, ids: &[u8], out: &mut Vec<f32>) {
         let mut facts = vec![0.0f32; ids.len() * CARD_FEATS];
         for (t, &id) in ids.iter().enumerate() {
@@ -304,5 +337,44 @@ impl Net {
             *x = gelu(*x);
         }
         dense(&b.w, &b.b, b.i, b.o, &hidden, ids.len(), out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apply(flat: &Flat, s: Span, x: &[f32]) -> Vec<f32> {
+        let bias = if s.b == usize::MAX { &[][..] } else { &flat.b[s.b..s.b + s.o] };
+        let mut out = Vec::new();
+        dense(&flat.w[s.w..s.w + s.i * s.o], bias, s.i, s.o, x, 1, &mut out);
+        out
+    }
+
+    #[test]
+    fn inference_projections_preserve_attention_and_policy() {
+        for seed in [7, 31, 107] {
+            let net = Net::random(seed);
+            let flat = net.flat();
+            let folded = net.inference_flat();
+            let l = NetLayout::new();
+            let x: Vec<f32> = (0..C).map(|i| (i as f32 * 0.37).sin()).collect();
+            let encoded = apply(flat, l.token_in, &x);
+            let want = [apply(flat, l.attn_k, &encoded), apply(flat, l.attn_v, &encoded)].concat();
+            let got = apply(&folded, l.attention_kv(), &x);
+            for (a, b) in got.iter().zip(want) { assert!((a - b).abs() < 1e-5); }
+
+            let context: Vec<f32> = (0..3 * ATTN).map(|i| (i as f32 * 0.19).cos()).collect();
+            let action: Vec<f32> = (0..D).map(|i| (i as f32 * 0.43).sin()).collect();
+            let policy = apply(flat, l.cfg_policy, &context);
+            let want: f32 = policy.iter().zip(&action).map(|(p, a)| p * a).sum();
+            let projected = apply(&folded, l.policy_action(), &action);
+            let belief = apply(flat, Span {
+                w: l.cfg_policy.w + ATTN * D, b: l.cfg_policy.b, i: 2 * ATTN, o: D,
+            }, &context[ATTN..]);
+            let got = context[..ATTN].iter().zip(projected).map(|(c, a)| c * a).sum::<f32>()
+                + action.iter().zip(belief).map(|(a, b)| a * b).sum::<f32>();
+            assert!((got - want).abs() < 1e-5 * want.abs().max(1.0), "seed {seed}: {got} vs {want}");
+        }
     }
 }

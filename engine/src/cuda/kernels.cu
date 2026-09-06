@@ -421,8 +421,8 @@ __global__ void k_public_cache(const Tree* trees, const unsigned int* part,
         : tree.tokens[((size_t)board[r] * NTYPE + t - N_HEXES) * c + j];
 }
 
-__global__ void k_attention(const Tree* trees, const float* key,
-                            const float* value, const unsigned int* part,
+__global__ void k_attention(const Tree* trees, const float* kv,
+                            const unsigned int* part,
                             const unsigned int* board,
                             const unsigned int* config, float* out, int n,
                             int tokens, int attn, int heads) {
@@ -432,10 +432,10 @@ __global__ void k_attention(const Tree* trees, const float* key,
     int width = attn / heads;
     const Tree& tree = trees[part[pair]];
     const float* q = tree.attn_query + (size_t)config[pair] * attn + head * width;
-    const float* k = key + ((size_t)board[pair] * tokens * heads + head) * width;
+    const float* k = kv + (size_t)board[pair] * tokens * 2 * attn + head * width;
     float top = neg_inf();
     for (int t = 0; t < tokens; ++t) {
-        float v = lane < width ? q[lane] * k[(size_t)t * attn + lane] : 0.0f;
+        float v = lane < width ? q[lane] * k[(size_t)t * 2 * attn + lane] : 0.0f;
         v = warp_sum(v) * rsqrtf((float)width);
         if (lane == 0) score[t] = v;
         top = fmaxf(top, v);
@@ -443,14 +443,19 @@ __global__ void k_attention(const Tree* trees, const float* key,
     __syncwarp();
     top = __shfl_sync(0xffffffff, top, 0);
     float total = 0.0f;
-    if (lane == 0)
-        for (int t = 0; t < tokens; ++t) total += expf(score[t] - top);
-    total = __shfl_sync(0xffffffff, total, 0);
-    const float* values = value + ((size_t)board[pair] * tokens * heads + head) * width;
+    for (int t = lane; t < tokens; t += 32) {
+        float v = expf(score[t] - top);
+        score[t] = v;
+        total += v;
+    }
+    total = warp_sum(total);
+    for (int t = lane; t < tokens; t += 32) score[t] /= total;
+    __syncwarp();
+    const float* values = k + attn;
     float mixed = 0.0f;
     if (lane < width)
         for (int t = 0; t < tokens; ++t)
-            mixed += expf(score[t] - top) / total * values[(size_t)t * attn + lane];
+            mixed += score[t] * values[(size_t)t * 2 * attn + lane];
     if (lane < width) out[(size_t)pair * attn + head * width + lane] = mixed;
 }
 
@@ -481,6 +486,18 @@ __global__ void k_attention_residual(const Tree* trees, float* out,
     for (int j = threadIdx.x; j < width; j += 32)
         out[(size_t)r * width + j] =
             (values[count++] - mean) * inv * gamma[j] + beta[j];
+}
+
+__global__ void k_attention_store(const Tree* trees, const unsigned int* part,
+                                  const unsigned int* at, const float* conditioned,
+                                  const float* projected, int n, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * width) return;
+    int r = i / width, j = i % width;
+    const Tree& tree = trees[part[r]];
+    size_t to = (size_t)at[r] * width + j;
+    tree.conditioned[to] = conditioned[i];
+    tree.value_cfg[to] = projected[i];
 }
 
 __global__ void k_cfg_slots(const float* phi, const unsigned int* owner,
@@ -721,7 +738,6 @@ __global__ void k_value(const Tree* trees, const int* part_of_row,
                         const int* local_row, const float* belief_projection,
                         const float* hidden_b, const float* out_w,
                         const float* out_b, int rows, int q0, int attn) {
-    __shared__ float hidden[128];
     int k = blockIdx.x, lane = threadIdx.x;
     if (k >= rows) return;
     int r = q0 + (k >> 1);
@@ -734,19 +750,14 @@ __global__ void k_value(const Tree* trees, const int* part_of_row,
     const float* bp = t.value_board + (size_t)board * attn;
     const float* rp = belief_projection + (size_t)k * attn;
     float* opinion = t.opinion + player * t.nvals + t.voff[node];
-    for (unsigned int c = 0; c < count; ++c) {
+    for (unsigned int c = threadIdx.y; c < count; c += blockDim.y) {
         unsigned int pair = t.aidx[cs + c];
         const float* pp = t.value_cfg + (size_t)pair * attn;
-        if (lane < attn)
-            hidden[lane] = gelu1(pp[lane] + bp[lane] + rp[lane] + hidden_b[lane])
-                         * out_w[lane];
-        __syncthreads();
-        for (int offset = attn >> 1; offset > 0; offset >>= 1) {
-            if (lane < offset) hidden[lane] += hidden[lane + offset];
-            __syncthreads();
-        }
-        if (lane == 0) opinion[c] = hidden[0] + *out_b;
-        __syncthreads();
+        float acc = 0.0f;
+        for (int j = lane; j < attn; j += 32)
+            acc += gelu1(pp[j] + bp[j] + rp[j] + hidden_b[j]) * out_w[j];
+        acc = warp_sum(acc);
+        if (lane == 0) opinion[c] = acc + *out_b;
     }
 }
 
@@ -935,11 +946,23 @@ __global__ void k_act_add(float* z, const float* proj, const unsigned int* of,
     z[i] += proj[(size_t)of[i / width] * width + i % width];
 }
 
+__global__ void k_policy_offset(const float* action, const float* belief,
+                                const float* bias, const unsigned int* node,
+                                float* out, int n, int d) {
+    int a = blockIdx.x * blockDim.y + threadIdx.y, lane = threadIdx.x;
+    if (a >= n) return;
+    float acc = 0.0f;
+    for (int j = lane; j < d; j += 32)
+        acc += action[(size_t)a * d + j] * (belief[(size_t)node[a] * d + j] + bias[j]);
+    acc = warp_sum(acc);
+    if (lane == 0) out[a] = acc;
+}
+
 __global__ void k_prior(const Tree* trees, const unsigned int* part,
                         const unsigned int* node_of, const unsigned int* row_of,
                         const unsigned int* act_at, const unsigned int* cell_at,
                         const unsigned int* cells, const float* e,
-                        const float* belief_projection, const float* cfg_b,
+                        const float* offset,
                         const float* inv_t, int m, int d) {
     int k = blockIdx.y;
     if (k >= m) return;
@@ -954,19 +977,19 @@ __global__ void k_prior(const Tree* trees, const unsigned int* part,
     int lane = threadIdx.x;
     unsigned int cs = t.coff[2 * row_of[k] + me];
     unsigned int pair = t.aidx[cs + t.cell_row[so + a]];
-    const float* pp = t.policy_cfg + (size_t)pair * d;
-    const float* bp = belief_projection + (size_t)k * d;
-    float fp[8];
+    const float* pp = t.conditioned + (size_t)pair * d;
+    float fp[4];
     for (int q = 0; q < d / 32; ++q) {
         int j = lane + 32 * q;
-        fp[q] = pp[j] + bp[j] + cfg_b[j];
+        fp[q] = pp[j];
     }
     for (unsigned int cell = a; cell < b; ++cell) {
-        const float* ea = e + (size_t)(act_at[k] + cells[cell_at[k] + cell]) * d;
+        unsigned int action = act_at[k] + cells[cell_at[k] + cell];
+        const float* ea = e + (size_t)action * d;
         float acc = 0.0f;
         for (int q = 0; q < d / 32; ++q) acc += fp[q] * ea[lane + 32 * q];
         acc = warp_sum(acc);
-        if (lane == 0) t.prior[so + cell] = acc;
+        if (lane == 0) t.prior[so + cell] = acc + offset[action];
     }
     __syncwarp();
     float top = neg_inf();

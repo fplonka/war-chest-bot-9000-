@@ -81,7 +81,7 @@ def main():
     tr, te = block(buf.lo, split), block(split, buf.rows)
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
-    xpub, phi, w, seg, y, nseg, policy = b
+    xpub, phi, w, seg, y, nseg, _attention, policy = b
     assert xpub.shape == (len(tr[0]), PUBFEAT), xpub.shape
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1

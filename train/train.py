@@ -296,11 +296,11 @@ class Buffer:
 
 
 def forward_values(net, parts):
-    return net(*parts[:4], parts[5])
+    return net(*parts[:4], parts[5], parts[6])
 
 
-def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
-    v, pieces = net.evaluate(xpub, phi, w, seg, nseg)
+def losses(net, xpub, phi, w, seg, y, nseg, attention, policy=None, wp=1.0):
+    v, pieces = net.evaluate(xpub, phi, w, seg, nseg, attention)
     expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
     expected.index_add_(0, seg, v.detach() * w)
     residual = expected[0::2] + expected[1::2]
@@ -658,17 +658,20 @@ def main():
     k = n * args.cfgs_per_row
     x = torch.zeros(n, PUBFEAT, device=dev)
     phi = torch.zeros(k, CFEAT, device=dev)
-    seg = torch.arange(k, device=dev) % (2 * n)
+    segment = np.arange(k) % (2 * n)
+    slot, width = gpu_batch.attention_layout(segment // 2, n)
+    attention = (torch.as_tensor(slot, device=dev), width)
+    seg = torch.as_tensor(segment, device=dev)
     w = torch.bincount(seg, minlength=2 * n).float().reciprocal()[seg]
     y = torch.zeros(k, device=dev)
-    parts = (x, phi, w, seg, y, 2 * n, None)
+    parts = (x, phi, w, seg, y, 2 * n, attention, None)
     scratch = Net().to(dev)
     scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr, fused=True)
     losses(scratch, *parts, wp=0.0)[0].backward()
     scratch_opt.step()
     forward_values(scratch, parts)
     torch.cuda.synchronize(dev)
-    del scratch_opt, scratch, parts, x, phi, w, seg, y
+    del scratch_opt, scratch, parts, x, phi, w, seg, y, attention
 
     torch.manual_seed(args.seed)
     value = Net().to(dev)

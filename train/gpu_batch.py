@@ -18,6 +18,14 @@ def _tables(device_text):
     return cards, locations
 
 
+def attention_layout(board_of, boards):
+    counts = np.bincount(board_of, minlength=boards)
+    order = np.argsort(board_of)
+    slot = np.empty(len(board_of), np.int64)
+    slot[order] = np.arange(len(board_of)) - (counts.cumsum() - counts)[board_of[order]]
+    return slot, int(counts.max(initial=0))
+
+
 def make_batch(parts, rng, device):
     parts = mirror.mirror_batch(parts, rng.random(len(parts[0])) < 0.5)
     rows, cc, _cp, cw, cy, seg, pol = parts
@@ -41,8 +49,9 @@ def make_batch(parts, rng, device):
     policy = (t(pa, torch.uint8), t(parow, torch.long),
               t(pact, torch.long), t(pcrow, torch.long), t(pcfg, torch.long),
               t(pprob, torch.float32), t(inv, torch.long), len(groups))
+    slot, width = attention_layout(seg // 2, n)
     return (x, phi, t(cw, torch.float32), t(seg, torch.long),
-            t(cy, torch.float32), 2 * n, policy)
+            t(cy, torch.float32), 2 * n, (t(slot, torch.long), width), policy)
 
 
 def warmup(device):
