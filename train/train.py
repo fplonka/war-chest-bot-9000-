@@ -31,6 +31,9 @@ CNORM = warchest.CNORM
 ROW_BYTES = warchest.ROW_BYTES
 ACT_BYTES = warchest.ACT_BYTES
 NSLOT = warchest.NSLOT
+N_LOCATIONS = warchest.N_LOCATIONS
+UNLABELED = 255
+OWNERSHIP_WEIGHT = 0.1
 
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
 POLICY_METRICS = ("policy_loss", "policy_target_entropy", "policy_prior_entropy",
@@ -83,6 +86,7 @@ class Buffer:
         self.source = np.zeros(cap, np.uint8)
         self.truth = np.zeros((cap, 2), np.uint32)
         self.outcome = np.full((cap, 2), np.nan, np.float32)
+        self.ownership = np.full((cap, N_LOCATIONS), UNLABELED, np.uint8)
         self.td1 = np.zeros(cap, np.uint8)
         self.acts = 0
         self.cells = 0
@@ -92,7 +96,7 @@ class Buffer:
 
     _ROW_FIELDS = (
         "x", "cstart", "clen", "pastart", "palen", "pcstart", "pclen",
-        "written_at", "created_at", "source", "truth", "outcome", "td1")
+        "written_at", "created_at", "source", "truth", "outcome", "ownership", "td1")
     _ARENAS = (
         ("cstart", "clen", ("cc", "cw", "cy"), "cfgs", "ccap"),
         ("pastart", "palen", ("pa",), "acts", "acap"),
@@ -142,8 +146,8 @@ class Buffer:
             getattr(self, start)[ring] += base
         self.soff = np.asarray(state["soff"], np.int64).copy()
 
-    def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, created,
-            td1, pol=None):
+    def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, ownership,
+            created, td1, pol=None):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         m = len(cw)
@@ -175,6 +179,7 @@ class Buffer:
             self.source[ring] = source[i:j]
             self.truth[ring] = truth[i:j]
             self.outcome[ring] = outcome[i:j]
+            self.ownership[ring] = ownership[i:j]
             self.td1[ring] = td1[i:j]
         sl = (np.arange(m) + self.cfgs) % self.ccap
         self.cc[sl], self.cw[sl], self.cy[sl] = cc, cw, cy
@@ -243,7 +248,8 @@ class Buffer:
         mass = np.bincount(seg, weights=cw, minlength=2 * len(ids)).astype(np.float32)
         cw /= mass[seg]
         return (self.x[s], self.cc[at], player, cw,
-                self.cy[at].astype(np.float32), seg, pol)
+                self.cy[at].astype(np.float32), seg, pol,
+                self.ownership[s].astype(np.int64))
 
     def sample_ids(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         ids = rng.integers(self.lo, self.rows, size=batch)
@@ -299,7 +305,8 @@ def forward_values(net, parts):
     return net(*parts[:4], parts[5])
 
 
-def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
+def losses(net, xpub, phi, w, seg, y, nseg, policy=None, ownership=None,
+           wp=1.0, wo=0.0):
     v, pieces = net.evaluate(xpub, phi, w, seg, nseg)
     expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
     expected.index_add_(0, seg, v.detach() * w)
@@ -318,6 +325,13 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
         if pl is not None:
             loss = loss + wp * pl
             stats.update(policy_stats)
+    if ownership is not None and wo > 0.0 and (ownership != UNLABELED).any():
+        logits = net.ownership_logits(pieces[3], pieces[5])
+        own_loss = F.cross_entropy(logits.flatten(0, 1), ownership.flatten(),
+                                   ignore_index=UNLABELED)
+        loss = loss + wo * own_loss
+        stats["ownership_loss_sum"] = own_loss.detach()
+        stats["ownership_steps"] = ownership.new_tensor(1.0)
     return loss, stats
 
 
@@ -438,7 +452,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             f1 = torch.cuda.Event(enable_timing=True)
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
-        loss, step_stat = losses(net, *parts, wp=policy_w)
+        loss, step_stat = losses(net, *parts, wp=policy_w, wo=OWNERSHIP_WEIGHT)
         stat["steps"] += 1
         stat["zero_sum_n"] += parts[5] // 2
         stat["policy_steps"] += "policy_loss_sum" in step_stat
@@ -483,6 +497,7 @@ def ingest(buf, data, warm=False):
     source = np.where(query != 0, 2, 0 if warm else 1).astype(np.uint8)
     truth = np.asarray(data["truth"], np.uint32).reshape(-1, 2)
     outcome = np.asarray(data["outcome"], np.float32).reshape(-1, 2)
+    ownership = np.asarray(data["ownership"], np.uint8).reshape(-1, N_LOCATIONS)
     created = np.asarray(data["created"], np.float64)
     td1 = np.asarray(data["td1"], np.uint8)
     pol = (np.asarray(data["pa"], np.uint8).reshape(-1, ACT_BYTES),
@@ -492,7 +507,7 @@ def ingest(buf, data, warm=False):
            np.asarray(data["pcell"], np.uint16),
            np.asarray(data["pprob"], np.float16))
     buf.add(x, cc, cw, cy.astype(np.float16), coff, soff,
-            source, truth, outcome, created, td1, pol)
+            source, truth, outcome, ownership, created, td1, pol)
     return len(x)
 
 
@@ -661,7 +676,7 @@ def main():
     seg = torch.arange(k, device=dev) % (2 * n)
     w = torch.bincount(seg, minlength=2 * n).float().reciprocal()[seg]
     y = torch.zeros(k, device=dev)
-    parts = (x, phi, w, seg, y, 2 * n, None)
+    parts = (x, phi, w, seg, y, 2 * n, None, None)
     scratch = Net().to(dev)
     scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr, fused=True)
     losses(scratch, *parts, wp=0.0)[0].backward()
@@ -901,6 +916,7 @@ def main():
             next_report = now + 10.0
             steps = int(window["train_steps"])
             lv = window["loss_sum"] / max(steps, 1)
+            lo = window["ownership_loss_sum"] / max(int(window["ownership_steps"]), 1)
             if probe is None and len(buf) >= 2048:
                 probe = batcher(buf.sample(2048, diag_rng), diag_rng, dev)
             diag = diagnostics(value, buf, probe, args.batch, diag_rng, dev, batcher,
@@ -975,7 +991,8 @@ def main():
                     "games", "white_wins", "black_wins", "draws", "decisions",
                     "rows", "solves", "query_rows", "dropped")},
                 "loss": round(lv, 5),
-                "total_loss": round(lv + args.policy_w * policy["policy_loss"], 5),
+                "total_loss": round(lv + args.policy_w * policy["policy_loss"]
+                                    + OWNERSHIP_WEIGHT * lo, 5),
                 **{key: round(diag[key], 5) for key in ("loss_old", "loss_new")},
                 "zero_sum_max": round(window["zero_sum_max"], 5),
                 "zero_sum_rms": round((window["zero_sum_square_sum"]
@@ -1047,6 +1064,7 @@ def main():
                 "solves_per_s": round(raw_sps, 1),
                 **{key: round(value, 5) for key, value in policy.items()},
                 "policy_weighted_loss": round(args.policy_w * policy["policy_loss"], 5),
+                "ownership_loss": round(lo, 5),
                 "budget_hits": int(hits),
                 "entity_hits": {names[i]: ent_hits[i] for i in range(8)},
                 "slots": int(data.get("slots", 0)),
@@ -1066,7 +1084,7 @@ def main():
                 f"W{rec['white_wins']}/B{rec['black_wins']}/D{rec['draws']}/T{int(window['timeouts'])} "
                 f"qrows={rec['query_rows']} "
                 f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
-                f"Lp={rec['policy_loss']:.3f} "
+                f"Lp={rec['policy_loss']:.3f} Lo={rec['ownership_loss']:.3f} "
                 f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
                 f"gen={gen_s:.2f}s train={train_s:.2f}s "
                 f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "

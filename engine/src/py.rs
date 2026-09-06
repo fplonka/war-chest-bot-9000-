@@ -81,6 +81,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         ("config offsets", d.coff.len(), if d.nv == 0 { 0 } else { 2 * d.nv + 1 }),
         ("truth", d.truth.len(), 2 * d.nv),
         ("outcomes", d.outcome.len(), 2 * d.nv),
+        ("ownership", d.ownership.len(), crate::board::N_LOCATIONS * d.nv),
         ("creation times", d.created.len(), d.nv),
         ("query labels", d.query.len(), d.nv),
         ("TD(1) labels", d.td1.len(), d.nv),
@@ -104,7 +105,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, coff = d.coff,
         pa = d.pa, paoff = d.paoff, pcoff = d.pcoff, pci = d.pci,
         pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome,
-        created = d.created, query = d.query, td1 = d.td1, soff = soff,
+        ownership = d.ownership, created = d.created, query = d.query, td1 = d.td1, soff = soff,
     }
     out.set_item("row_bytes", crate::pbs::ROW_BYTES)?;
     out.set_item("solves", n_solves)?;
@@ -267,6 +268,11 @@ fn hex_location_flags() -> Vec<u8> {
 }
 
 #[pyfunction]
+fn location_hexes() -> Vec<u8> {
+    board().location_hexes.to_vec()
+}
+
+#[pyfunction]
 fn hex_neighbours() -> Vec<u8> {
     crate::board::neighbour_gather()
 }
@@ -402,6 +408,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
+    m.add_function(wrap_pyfunction!(location_hexes, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     m.add("ENT_NAMES", Ent::NAME.to_vec())?;

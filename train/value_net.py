@@ -83,12 +83,16 @@ class Net(nn.Module):
         self.join_out = nn.Linear(JW, D)
         self.ln_h = nn.LayerNorm(D)
         self.value_bias = nn.Parameter(torch.zeros(1))
+        self.ownership_context = nn.Linear(2 * D, C)
+        self.ownership_out = nn.Linear(C, 3)
 
         nn.init.normal_(self.cfg_f.weight, std=1e-3)
         nn.init.zeros_(self.cfg_f.bias)
 
         nb = torch.as_tensor(warchest.hex_neighbours(), dtype=torch.long)
         self.register_buffer("nb", nb.view(N_HEXES, 6), persistent=False)
+        self.register_buffer("locations", torch.as_tensor(warchest.location_hexes()),
+                             persistent=False)
         self.register_buffer("seat_of", torch.arange(NTYPE) // NSLOT,
                              persistent=False)
 
@@ -185,6 +189,10 @@ class Net(nn.Module):
 
     def forward(self, xpub, phi, weight, seg, nseg):
         return self.evaluate(xpub, phi, weight, seg, nseg)[0]
+
+    def ownership_logits(self, spatial, heads):
+        context = self.ownership_context(heads.reshape(spatial.shape[0], -1)).unsqueeze(1)
+        return self.ownership_out(gelu(spatial[:, self.locations] + context))
 
 
     def flat(self):

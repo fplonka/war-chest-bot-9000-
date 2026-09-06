@@ -19,6 +19,7 @@ def load_buffer_module():
         "N_KINDS": 1,
         "NSLOT": 1,
         "N_HEXES": 3,
+        "N_LOCATIONS": 2,
     }.items():
         setattr(warchest, name, value)
     torch = types.ModuleType("torch")
@@ -70,6 +71,9 @@ def chunk(train, start, n):
     truth = np.zeros((n, 2), np.uint32)
     outcome = np.full((n, 2), np.nan, np.float32)
     outcome[ids % 5 == 0] = (0.25, -0.25)
+    ownership = np.full((n, train.N_LOCATIONS), train.UNLABELED, np.uint8)
+    labeled = (ids % 5 == 0) & (ids % 7 == 0)
+    ownership[labeled] = (ids[labeled, None] + np.arange(train.N_LOCATIONS)) % 3
     created = (1000.0 + ids).astype(np.float64)
     td1 = (ids % 7 == 0).astype(np.uint8)
 
@@ -94,7 +98,7 @@ def chunk(train, start, n):
     ])
     policy = (pa, paoff, pcoff, pci, pact, pprob)
     return (rows, cc, cw, cy, coff, boundaries, source, truth, outcome,
-            created, td1, policy)
+            ownership, created, td1, policy)
 
 
 def assert_same(left, right):
@@ -132,6 +136,8 @@ def main():
     assert len(restored) == len(buf)
     ids = np.arange(buf.lo, buf.rows)
     assert_same(buf.gather(ids), restored.gather(ids))
+    targets = buf.gather(ids)[-1]
+    assert np.all((targets < 3) == ((ids % 5 == 0) & (ids % 7 == 0))[:, None])
     assert_same(buf.ordered(), restored.ordered())
     assert buf.replay_stats() == restored.replay_stats()
     assert buf.span_seconds() == restored.span_seconds()

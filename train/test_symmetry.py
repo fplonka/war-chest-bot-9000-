@@ -18,7 +18,9 @@ def main():
     policy = (desc, np.asarray([0, 1, 2]), np.asarray([0, 0, 1]),
               np.asarray([0, 1, 2]), np.asarray([0.2, 0.8, 1.0], np.float32),
               np.asarray([0, 0, 1]))
-    parts = (rows, cc, player, weight, target, seg, policy)
+    ownership = np.tile(np.asarray([0, 1, 2, 255]),
+                        (2, (warchest.N_LOCATIONS + 3) // 4))[:, :warchest.N_LOCATIONS]
+    parts = (rows, cc, player, weight, target, seg, policy, ownership)
     flipped = np.asarray([True, False])
 
     once = mirror.mirror_batch(parts, flipped)
@@ -35,6 +37,10 @@ def main():
         assert np.array_equal(got, want)
     for got, want in zip(twice[6], parts[6]):
         assert np.array_equal(got, want)
+    assert np.array_equal(once[7][1], ownership[1])
+    turned = ownership[0][mirror.LOCATION_MAP]
+    assert np.array_equal(once[7][0], np.where(turned < 2, 1 - turned, turned))
+    assert np.array_equal(twice[7], ownership)
     print("replay symmetry OK")
 
 

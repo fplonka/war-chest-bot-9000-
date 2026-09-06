@@ -6,6 +6,9 @@ N_HEXES = warchest.N_HEXES
 NSLOT = warchest.NSLOT
 NTYPE = warchest.NTYPE
 HEXMAP = np.asarray(warchest.hex_mirror(), np.int64)
+LOCATION_HEXES = np.asarray(warchest.location_hexes(), np.int64)
+LOCATION_INDEX = {int(h): i for i, h in enumerate(LOCATION_HEXES)}
+LOCATION_MAP = np.asarray([LOCATION_INDEX[int(HEXMAP[h])] for h in LOCATION_HEXES])
 
 
 def mirror_rows(rows):
@@ -14,7 +17,7 @@ def mirror_rows(rows):
 
 
 def mirror_batch(parts, flipped):
-    rows, cc, player, weight, target, seg, policy = parts
+    rows, cc, player, weight, target, seg, policy, ownership = parts
     flipped = np.asarray(flipped, dtype=bool)
     if flipped.shape != (len(rows),):
         raise ValueError("one symmetry choice is required per replay row")
@@ -23,6 +26,9 @@ def mirror_batch(parts, flipped):
 
     rows = rows.copy()
     rows[flipped] = mirror_rows(rows[flipped])
+    ownership = ownership.copy()
+    owners = ownership[flipped][:, LOCATION_MAP]
+    ownership[flipped] = np.where(owners < 2, 1 - owners, owners)
     turned = flipped[seg // 2]
     player = player.copy()
     player[turned] ^= 1
@@ -41,4 +47,4 @@ def mirror_batch(parts, flipped):
         actions[here, field] = HEXMAP[actions[here, field]]
     desc[moved] = actions
     policy = (desc, pact, pcrow, pcfg, probability, parow)
-    return rows, cc, player, weight, target, seg, policy
+    return rows, cc, player, weight, target, seg, policy, ownership

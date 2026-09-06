@@ -1,5 +1,5 @@
 use crate::actions::{Action, N_PLAYS};
-use crate::board::NONE;
+use crate::board::{board, NONE, N_LOCATIONS};
 use crate::net::Net;
 use crate::pbs::*;
 use crate::policy;
@@ -58,6 +58,7 @@ pub struct Data {
 
     pub truth: Vec<u32>,
     pub outcome: Vec<f32>,
+    pub ownership: Vec<u8>,
     pub created: Vec<f64>,
     solve_created: f64,
     pub query: Vec<u8>,
@@ -89,7 +90,9 @@ impl Data {
         macro_rules! append {
             ($($name:ident),* $(,)?) => { $( self.$name.extend(o.$name); )* };
         }
-        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query, td1);
+        append!(
+            rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, ownership, created, query, td1
+        );
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
@@ -163,6 +166,7 @@ impl Data {
         *self.pcoff.last_mut().expect("row offset") = self.pcell.len() as u32;
         self.truth.extend(truth);
         self.outcome.extend([f32::NAN; 2]);
+        self.ownership.extend([NONE; N_LOCATIONS]);
         self.created.push(self.solve_created);
         self.query.push(0);
         self.td1.push(0);
@@ -385,6 +389,13 @@ impl Game {
                 self.pending.outcome[2 * r + p] = outcome[p];
                 let at = self.pending.row_span(r, p).start + self.pending.truth[2 * r + p] as usize;
                 self.pending.cy[at] = z[p];
+            }
+            if ended {
+                let target =
+                    &mut self.pending.ownership[r * N_LOCATIONS..(r + 1) * N_LOCATIONS];
+                for (owner, &hex) in target.iter_mut().zip(&board().location_hexes) {
+                    *owner = self.s.loc_marker[hex as usize].min(2);
+                }
             }
         }
         let pending = std::mem::take(&mut self.pending);
@@ -615,6 +626,42 @@ mod target_tests {
         out.dropped += stream.enqueue(nominations);
         assert_eq!(stream.pending.len(), QUEUE_CAP);
         assert_eq!(out.dropped, 3);
+    }
+
+    #[test]
+    fn completed_td1_rows_get_location_ownership() {
+        let gc = GameCfg {
+            agents: [Agent::Random; 2],
+            collect: Collect::None,
+            explore: 0.0,
+            random_draft: false,
+            p_td1: 1.0,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        let mut ended = Game::new(Rng::new(5), &gc);
+        resolve_fixture_chance(&mut ended);
+        let values = [
+            vec![0.0; ended.bel[0].len()],
+            vec![0.0; ended.bel[1].len()],
+        ];
+        ended.record([&values[0], &values[1]], &Default::default());
+        let player = ended.s.to_act();
+        let locations = board().location_hexes;
+        for &hex in &locations[..5] {
+            ended.s.set_marker(hex, player);
+        }
+        let last = locations[5];
+        ended.s.set_unit(last, player, 0, 1);
+        ended.s.add_zone(player, crate::state::Z_HAND, 0, 1);
+        ended.s.set_markers_hand(player, 1);
+        ended.s.apply_inplace(Action::Control { from: last });
+        assert!(ended.s.is_terminal());
+        ended.finish();
+        let complete = ended.take_ready();
+        assert!(complete.outcome.iter().all(|x| x.is_finite()));
+        assert_eq!(&complete.ownership[..6], &[player; 6]);
+        assert!(complete.ownership[6..].iter().all(|&x| x == 2));
     }
 
     #[test]

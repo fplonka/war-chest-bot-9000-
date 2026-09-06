@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
-from train import ACT_BYTES, CCOUNTS, ROW_BYTES, Buffer
+from train import ACT_BYTES, CCOUNTS, N_LOCATIONS, ROW_BYTES, Buffer
 
 
 def dump(n, ncfg, na, ncells):
@@ -28,14 +28,15 @@ def dump(n, ncfg, na, ncells):
     source = np.ones(n, np.uint8)
     truth = np.zeros((n, 2), np.uint32)
     outcome = np.full((n, 2), np.nan, np.float32)
+    ownership = np.full((n, N_LOCATIONS), 255, np.uint8)
     created = np.zeros(n, np.float64)
     td1 = np.zeros(n, np.uint8)
     pol = (pa, paoff, pcoff, pci, pact, pprob)
-    return rows, cc, cw, cy, coff, soff, source, truth, outcome, created, td1, pol
+    return rows, cc, cw, cy, coff, soff, source, truth, outcome, ownership, created, td1, pol
 
 
 def check(buf, ids):
-    _x, cc, _cp, _cw, _cy, _seg, pol = buf.gather(ids)
+    _x, cc, _cp, _cw, _cy, _seg, pol, _ownership = buf.gather(ids)
     pa, pact, _pcrow, pcfg, _pp, _parow = pol
     n_cfg, n_act = len(cc), len(pa)
     assert pcfg.size == 0 or int(pcfg.max()) < n_cfg, (int(pcfg.max()), n_cfg)
